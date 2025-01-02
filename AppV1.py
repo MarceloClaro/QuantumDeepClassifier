@@ -32,6 +32,8 @@ import cv2
 import io
 import warnings
 from datetime import datetime  # Importação para data e hora
+import plotly.graph_objects as go
+import plotly.express as px
 
 # Importações adicionais para o modo quântico
 import tensorflow as tf
@@ -140,15 +142,16 @@ def visualize_data(dataset, classes):
     """
     Exibe algumas imagens do conjunto de dados com suas classes.
     """
-    st.write("Visualização de algumas imagens do conjunto de dados:")
-    fig, axes = plt.subplots(1, 10, figsize=(20, 4))
+    st.write("### Visualização de Algumas Imagens do Conjunto de Dados")
+    fig = plt.figure(figsize=(15, 5))
     for i in range(10):
         idx = np.random.randint(len(dataset))
         image, label = dataset[idx]
         image = np.array(image)  # Converter a imagem PIL em array NumPy
-        axes[i].imshow(image)
-        axes[i].set_title(classes[label])
-        axes[i].axis('off')
+        ax = fig.add_subplot(2, 5, i+1)
+        ax.imshow(image)
+        ax.set_title(classes[label])
+        ax.axis('off')
     st.pyplot(fig)
     plt.close(fig)  # Fechar a figura para liberar memória
 
@@ -163,25 +166,17 @@ def plot_class_distribution(dataset, classes):
     df = pd.DataFrame({'Classe': labels})
 
     # Plotar o gráfico com as contagens
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.countplot(x='Classe', data=df, ax=ax, palette="Set2", hue='Classe', dodge=False)
-
-    # Definir ticks e labels
-    ax.set_xticks(range(len(classes)))
-    ax.set_xticklabels(classes, rotation=45)
-
-    # Remover a legenda
-    ax.get_legend().remove()
-
+    fig = plt.figure(figsize=(10, 6))
+    sns.countplot(x='Classe', data=df, palette="Set2")
+    plt.title("Distribuição das Classes (Quantidade de Imagens)")
+    plt.xlabel("Classes")
+    plt.ylabel("Número de Imagens")
+    
     # Adicionar as contagens acima das barras
     class_counts = df['Classe'].value_counts().sort_index()
     for i, count in enumerate(class_counts):
-        ax.text(i, count, str(count), ha='center', va='bottom', fontweight='bold')
-
-    ax.set_title("Distribuição das Classes (Quantidade de Imagens)")
-    ax.set_xlabel("Classes")
-    ax.set_ylabel("Número de Imagens")
-
+        plt.text(i, count + max(class_counts)*0.01, str(count), ha='center', va='bottom', fontweight='bold')
+    
     st.pyplot(fig)
     plt.close(fig)  # Fechar a figura para liberar memória
 
@@ -298,18 +293,18 @@ def display_all_augmented_images(df, class_names, max_images=None):
     """
     if max_images is not None:
         df = df.head(max_images)
-        st.write(f"**Visualização das Primeiras {max_images} Imagens após Data Augmentation:**")
+        st.write(f"### Visualização das Primeiras {max_images} Imagens após Data Augmentation:")
     else:
-        st.write("**Visualização de Todas as Imagens após Data Augmentation:**")
-    
+        st.write("### Visualização de Todas as Imagens após Data Augmentation:")
+
     num_images = len(df)
     if num_images == 0:
         st.write("Nenhuma imagem para exibir.")
         return
-    
+
     cols_per_row = 5  # Número de colunas por linha
     rows = (num_images + cols_per_row - 1) // cols_per_row  # Calcula o número de linhas necessárias
-    
+
     for row in range(rows):
         cols = st.columns(cols_per_row)
         for col in range(cols_per_row):
@@ -322,7 +317,7 @@ def display_all_augmented_images(df, class_names, max_images=None):
 
 def visualize_embeddings(df, class_names):
     """
-    Reduz a dimensionalidade dos embeddings e os visualiza em 2D.
+    Reduz a dimensionalidade dos embeddings e os visualiza em 2D usando Plotly.
     
     Args:
         df (pd.DataFrame): DataFrame contendo os embeddings e rótulos.
@@ -342,19 +337,13 @@ def visualize_embeddings(df, class_names):
         'label': labels
     })
 
-    # Plotar
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=plot_df, x='PC1', y='PC2', hue='label', palette='Set2', legend='full')
+    # Plotar com Plotly
+    fig = px.scatter(plot_df, x='PC1', y='PC2', color='label',
+                     labels={'label': 'Classe'},
+                     title='Visualização dos Embeddings com PCA',
+                     hover_data=['label'])
 
-    # Configurações do gráfico
-    plt.title('Visualização dos Embeddings com PCA')
-    plt.legend(title='Classes', labels=class_names)
-    plt.xlabel('Componente Principal 1')
-    plt.ylabel('Componente Principal 2')
-    
-    # Exibir no Streamlit
-    st.pyplot(plt)
-    plt.close()  # Fechar a figura para liberar memória
+    st.plotly_chart(fig, use_container_width=True)
 
 def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience):
     """
@@ -401,11 +390,11 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
     if model_for_embeddings is None:
         return None
 
-    st.write("**Processando o conjunto de treinamento para incluir Data Augmentation e Embeddings...**")
+    st.write("**Processando o Conjunto de Treinamento para Inclusão de Data Augmentation e Embeddings...**")
     train_df = apply_transforms_and_get_embeddings(train_dataset, model_for_embeddings, train_transforms, batch_size=batch_size)
-    st.write("**Processando o conjunto de validação...**")
+    st.write("**Processando o Conjunto de Validação...**")
     valid_df = apply_transforms_and_get_embeddings(valid_dataset, model_for_embeddings, test_transforms, batch_size=batch_size)
-    st.write("**Processando o conjunto de teste...**")
+    st.write("**Processando o Conjunto de Teste...**")
     test_df = apply_transforms_and_get_embeddings(test_dataset, model_for_embeddings, test_transforms, batch_size=batch_size)
 
     # Mapear rótulos para nomes de classes
@@ -417,13 +406,13 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
     test_df['class_name'] = test_df['label'].map(idx_to_class)
 
     # Exibir dataframes no Streamlit sem a coluna 'augmented_image' e sem limitar a 5 linhas
-    st.write("**Dataframe do Conjunto de Treinamento com Data Augmentation e Embeddings:**")
+    st.write("### Dataframe do Conjunto de Treinamento com Data Augmentation e Embeddings:")
     st.dataframe(train_df.drop(columns=['augmented_image']))
 
-    st.write("**Dataframe do Conjunto de Validação:**")
+    st.write("### Dataframe do Conjunto de Validação:")
     st.dataframe(valid_df.drop(columns=['augmented_image']))
 
-    st.write("**Dataframe do Conjunto de Teste:**")
+    st.write("### Dataframe do Conjunto de Teste:")
     st.dataframe(test_df.drop(columns=['augmented_image']))
 
     # Exibir todas as imagens augmentadas (ou limitar conforme necessário)
@@ -433,13 +422,19 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
     visualize_embeddings(train_df, full_dataset.classes)
 
     # Exibir contagem de imagens por classe nos conjuntos de treinamento e teste
-    st.write("**Distribuição das Classes no Conjunto de Treinamento:**")
+    st.write("### Distribuição das Classes no Conjunto de Treinamento:")
     train_class_counts = train_df['class_name'].value_counts()
-    st.bar_chart(train_class_counts)
+    fig = px.bar(train_class_counts, x=train_class_counts.index, y=train_class_counts.values,
+                 labels={'x': 'Classe', 'y': 'Número de Imagens'},
+                 title='Distribuição das Classes no Conjunto de Treinamento')
+    st.plotly_chart(fig, use_container_width=True)
 
-    st.write("**Distribuição das Classes no Conjunto de Teste:**")
+    st.write("### Distribuição das Classes no Conjunto de Teste:")
     test_class_counts = test_df['class_name'].value_counts()
-    st.bar_chart(test_class_counts)
+    fig = px.bar(test_class_counts, x=test_class_counts.index, y=test_class_counts.values,
+                 labels={'x': 'Classe', 'y': 'Número de Imagens'},
+                 title='Distribuição das Classes no Conjunto de Teste')
+    st.plotly_chart(fig, use_container_width=True)
 
     # Atualizar os datasets com as transformações para serem usados nos DataLoaders
     train_dataset = CustomDataset(torch.utils.data.Subset(full_dataset, train_indices), transform=train_transforms)
@@ -545,31 +540,51 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
         st.session_state.valid_losses.append(valid_epoch_loss)
         st.session_state.valid_accuracies.append(valid_epoch_acc.item())
 
-        # Atualizar gráficos dinamicamente
+        # Atualizar gráficos dinamicamente usando Plotly
         with placeholder.container():
-            fig, ax = plt.subplots(1, 2, figsize=(14, 5))
-
-            # Get current timestamp
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            fig = go.Figure()
 
             # Gráfico de Perda
-            ax[0].plot(range(1, len(st.session_state.train_losses) + 1), st.session_state.train_losses, label='Treino')
-            ax[0].plot(range(1, len(st.session_state.valid_losses) + 1), st.session_state.valid_losses, label='Validação')
-            ax[0].set_title(f'Perda por Época ({timestamp})')
-            ax[0].set_xlabel('Épocas')
-            ax[0].set_ylabel('Perda')
-            ax[0].legend()
+            fig.add_trace(go.Scatter(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.train_losses,
+                mode='lines+markers',
+                name='Perda de Treino',
+                line=dict(color='blue')
+            ))
+            fig.add_trace(go.Scatter(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.valid_losses,
+                mode='lines+markers',
+                name='Perda de Validação',
+                line=dict(color='red')
+            ))
 
             # Gráfico de Acurácia
-            ax[1].plot(range(1, len(st.session_state.train_accuracies) + 1), st.session_state.train_accuracies, label='Treino')
-            ax[1].plot(range(1, len(st.session_state.valid_accuracies) + 1), st.session_state.valid_accuracies, label='Validação')
-            ax[1].set_title(f'Acurácia por Época ({timestamp})')
-            ax[1].set_xlabel('Épocas')
-            ax[1].set_ylabel('Acurácia')
-            ax[1].legend()
+            fig.add_trace(go.Scatter(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.train_accuracies,
+                mode='lines+markers',
+                name='Acurácia de Treino',
+                line=dict(color='green')
+            ))
+            fig.add_trace(go.Scatter(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.valid_accuracies,
+                mode='lines+markers',
+                name='Acurácia de Validação',
+                line=dict(color='orange')
+            ))
 
-            st.pyplot(fig)
-            plt.close(fig)  # Fechar a figura para liberar memória
+            fig.update_layout(
+                title=f'Epoca {epoch+1}/{epochs} - Treinamento e Validação',
+                xaxis_title='Épocas',
+                yaxis_title='Valor',
+                legend=dict(x=0, y=1.1, orientation='h'),
+                template='plotly_white'
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
 
         # Atualizar texto de progresso
         progress = (epoch + 1) / epochs
@@ -580,26 +595,40 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
         with st.sidebar.expander("Histórico de Treinamento", expanded=True):
             timestamp_hist = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # Gráfico de Perda
-            fig_loss, ax_loss = plt.subplots(figsize=(5, 3))
-            ax_loss.plot(st.session_state.train_losses, label='Perda de Treino')
-            ax_loss.plot(st.session_state.valid_losses, label='Perda de Validação')
-            ax_loss.set_title(f'Histórico de Perda ({timestamp_hist})')
-            ax_loss.set_xlabel('Época')
-            ax_loss.set_ylabel('Perda')
-            ax_loss.legend()
-            st.pyplot(fig_loss)
-            plt.close(fig_loss)  # Fechar a figura para liberar memória
+            fig_loss = px.line(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.train_losses,
+                labels={'x': 'Época', 'y': 'Perda'},
+                title=f'Histórico de Perda ({timestamp_hist})',
+                name='Perda de Treino'
+            )
+            fig_loss.add_trace(go.Scatter(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.valid_losses,
+                mode='lines+markers',
+                name='Perda de Validação',
+                line=dict(color='red')
+            ))
+            fig_loss.update_layout(template='plotly_white')
+            st.plotly_chart(fig_loss, use_container_width=True)
 
             # Gráfico de Acurácia
-            fig_acc, ax_acc = plt.subplots(figsize=(5, 3))
-            ax_acc.plot(st.session_state.train_accuracies, label='Acurácia de Treino')
-            ax_acc.plot(st.session_state.valid_accuracies, label='Acurácia de Validação')
-            ax_acc.set_title(f'Histórico de Acurácia ({timestamp_hist})')
-            ax_acc.set_xlabel('Época')
-            ax_acc.set_ylabel('Acurácia')
-            ax_acc.legend()
-            st.pyplot(fig_acc)
-            plt.close(fig_acc)  # Fechar a figura para liberar memória
+            fig_acc = px.line(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.train_accuracies,
+                labels={'x': 'Época', 'y': 'Acurácia'},
+                title=f'Histórico de Acurácia ({timestamp_hist})',
+                name='Acurácia de Treino'
+            )
+            fig_acc.add_trace(go.Scatter(
+                x=list(range(1, epoch + 2)),
+                y=st.session_state.valid_accuracies,
+                mode='lines+markers',
+                name='Acurácia de Validação',
+                line=dict(color='orange')
+            ))
+            fig_acc.update_layout(template='plotly_white')
+            st.plotly_chart(fig_acc, use_container_width=True)
 
             # Botão para limpar o histórico
             if st.button("Limpar Histórico", key=f"limpar_historico_epoch_{epoch}"):
@@ -626,20 +655,20 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
     if best_model_wts is not None:
         model.load_state_dict(best_model_wts)
 
-    # Gráficos de Perda e Acurácia finais
+    # Gráficos de Perda e Acurácia finais usando Plotly
     plot_metrics(st.session_state.train_losses, st.session_state.valid_losses, 
                 st.session_state.train_accuracies, st.session_state.valid_accuracies)
 
     # Avaliação Final no Conjunto de Teste
-    st.write("**Avaliação no Conjunto de Teste**")
+    st.write("### Avaliação no Conjunto de Teste")
     compute_metrics(model, test_loader, full_dataset.classes)
 
     # Análise de Erros
-    st.write("**Análise de Erros**")
+    st.write("### Análise de Erros")
     error_analysis(model, test_loader, full_dataset.classes)
 
     # **Clusterização e Análise Comparativa**
-    st.write("**Análise de Clusterização**")
+    st.write("### Análise de Clusterização")
     perform_clustering(model, test_loader, full_dataset.classes)
 
     # Liberar memória
@@ -655,32 +684,56 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
 
 def plot_metrics(train_losses, valid_losses, train_accuracies, valid_accuracies):
     """
-    Plota os gráficos de perda e acurácia.
+    Plota os gráficos de perda e acurácia usando Plotly.
     """
-    epochs_range = range(1, len(train_losses) + 1)
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+    epochs_range = list(range(1, len(train_losses) + 1))
+    fig = go.Figure()
 
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Perda de Treino
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=train_losses,
+        mode='lines+markers',
+        name='Perda de Treino',
+        line=dict(color='blue')
+    ))
 
-    # Gráfico de Perda
-    ax[0].plot(epochs_range, train_losses, label='Treino')
-    ax[0].plot(epochs_range, valid_losses, label='Validação')
-    ax[0].set_title(f'Perda por Época ({timestamp})')
-    ax[0].set_xlabel('Épocas')
-    ax[0].set_ylabel('Perda')
-    ax[0].legend()
+    # Perda de Validação
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=valid_losses,
+        mode='lines+markers',
+        name='Perda de Validação',
+        line=dict(color='red')
+    ))
 
-    # Gráfico de Acurácia
-    ax[1].plot(epochs_range, train_accuracies, label='Treino')
-    ax[1].plot(epochs_range, valid_accuracies, label='Validação')
-    ax[1].set_title(f'Acurácia por Época ({timestamp})')
-    ax[1].set_xlabel('Épocas')
-    ax[1].set_ylabel('Acurácia')
-    ax[1].legend()
+    # Acurácia de Treino
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=train_accuracies,
+        mode='lines+markers',
+        name='Acurácia de Treino',
+        line=dict(color='green')
+    ))
 
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
+    # Acurácia de Validação
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=valid_accuracies,
+        mode='lines+markers',
+        name='Acurácia de Validação',
+        line=dict(color='orange')
+    ))
+
+    fig.update_layout(
+        title='Perda e Acurácia por Época',
+        xaxis_title='Épocas',
+        yaxis_title='Valor',
+        legend=dict(x=0, y=1.2, orientation='h'),
+        template='plotly_white'
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 def compute_metrics(model, dataloader, classes):
     """
@@ -706,37 +759,35 @@ def compute_metrics(model, dataloader, classes):
 
     # Relatório de Classificação
     report = classification_report(all_labels, all_preds, target_names=classes, output_dict=True)
-    st.text("Relatório de Classificação:")
+    st.text("### Relatório de Classificação:")
     st.write(pd.DataFrame(report).transpose())
 
-    # Matriz de Confusão Normalizada
+    # Matriz de Confusão Normalizada usando Plotly
     cm = confusion_matrix(all_labels, all_preds, normalize='true')
-    fig, ax = plt.subplots()
-    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', xticklabels=classes, yticklabels=classes, ax=ax)
-    ax.set_xlabel('Predito')
-    ax.set_ylabel('Verdadeiro')
-    ax.set_title('Matriz de Confusão Normalizada')
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
+    fig = px.imshow(cm, text_auto=True, labels=dict(x="Predito", y="Verdadeiro", color="Proporção"),
+                    x=classes, y=classes, title="Matriz de Confusão Normalizada",
+                    color_continuous_scale='Blues')
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Curva ROC
+    # Curva ROC usando Plotly
     if len(classes) == 2:
         fpr, tpr, thresholds = roc_curve(all_labels, [p[1] for p in all_probs])
         roc_auc = roc_auc_score(all_labels, [p[1] for p in all_probs])
-        fig, ax = plt.subplots()
-        ax.plot(fpr, tpr, label='AUC = %0.2f' % roc_auc)
-        ax.plot([0, 1], [0, 1], 'k--')
-        ax.set_xlabel('Taxa de Falsos Positivos')
-        ax.set_ylabel('Taxa de Verdadeiros Positivos')
-        ax.set_title('Curva ROC')
-        ax.legend(loc='lower right')
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'AUC = {roc_auc:.2f}'))
+        fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', name='Linha de Referência', line=dict(dash='dash')))
+        fig.update_layout(
+            title='Curva ROC',
+            xaxis_title='Taxa de Falsos Positivos',
+            yaxis_title='Taxa de Verdadeiros Positivos',
+            template='plotly_white'
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
         # Multiclasse
         binarized_labels = label_binarize(all_labels, classes=range(len(classes)))
         roc_auc = roc_auc_score(binarized_labels, np.array(all_probs), average='weighted', multi_class='ovr')
-        st.write(f"AUC-ROC Média Ponderada: {roc_auc:.4f}")
+        st.write(f"**AUC-ROC Média Ponderada:** {roc_auc:.4f}")
 
 def error_analysis(model, dataloader, classes):
     """
@@ -763,14 +814,15 @@ def error_analysis(model, dataloader, classes):
                     break
 
     if misclassified_images:
-        st.write("Algumas imagens mal classificadas:")
-        fig, axes = plt.subplots(1, min(5, len(misclassified_images)), figsize=(15, 3))
+        st.write("### Algumas Imagens Mal Classificadas:")
+        fig = plt.figure(figsize=(15, 3))
         for i in range(min(5, len(misclassified_images))):
             image = misclassified_images[i]
             image = image.permute(1, 2, 0).numpy()
-            axes[i].imshow(image)
-            axes[i].set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
-            axes[i].axis('off')
+            ax = fig.add_subplot(1, 5, i+1)
+            ax.imshow(image)
+            ax.set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
+            ax.axis('off')
         st.pyplot(fig)
         plt.close(fig)  # Fechar a figura para liberar memória
     else:
@@ -815,23 +867,27 @@ def perform_clustering(model, dataloader, classes):
     agglo = AgglomerativeClustering(n_clusters=len(classes))
     clusters_agglo = agglo.fit_predict(features)
 
-    # Plotagem dos resultados
-    fig, ax = plt.subplots(1, 2, figsize=(14, 6))
+    # Criar DataFrame para Plotagem
+    cluster_df = pd.DataFrame({
+        'PC1': features_2d[:, 0],
+        'PC2': features_2d[:, 1],
+        'Cluster KMeans': clusters_kmeans,
+        'Cluster Agglomerative': clusters_agglo
+    })
 
-    # Gráfico KMeans
-    scatter = ax[0].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_kmeans, cmap='viridis')
-    legend1 = ax[0].legend(*scatter.legend_elements(), title="Clusters")
-    ax[0].add_artist(legend1)
-    ax[0].set_title('Clusterização com KMeans')
+    # Plotar Clusterização com KMeans
+    fig_kmeans = px.scatter(cluster_df, x='PC1', y='PC2', color='Cluster KMeans',
+                            title='Clusterização com KMeans',
+                            labels={'Cluster KMeans': 'Clusters'},
+                            template='plotly_white')
+    st.plotly_chart(fig_kmeans, use_container_width=True)
 
-    # Gráfico Agglomerative Clustering
-    scatter = ax[1].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_agglo, cmap='viridis')
-    legend1 = ax[1].legend(*scatter.legend_elements(), title="Clusters")
-    ax[1].add_artist(legend1)
-    ax[1].set_title('Clusterização Hierárquica')
-
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
+    # Plotar Clusterização com Agglomerative Clustering
+    fig_agglo = px.scatter(cluster_df, x='PC1', y='PC2', color='Cluster Agglomerative',
+                           title='Clusterização Hierárquica',
+                           labels={'Cluster Agglomerative': 'Clusters'},
+                           template='plotly_white')
+    st.plotly_chart(fig_agglo, use_container_width=True)
 
     # Métricas de Avaliação
     ari_kmeans = adjusted_rand_score(labels, clusters_kmeans)
@@ -925,44 +981,64 @@ def visualize_activations(model, image, class_names, model_name, segmentation_mo
         segmentation_colored = cv2.resize(segmentation_colored, (image.size[0], image.size[1]))
 
         # Exibir as imagens: Imagem Original, Grad-CAM e Segmentação
-        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+        fig = make_subplots(rows=1, cols=3, subplot_titles=("Imagem Original", "Grad-CAM", "Segmentação"))
 
         # Imagem original
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[0].axis('off')
+        fig.add_trace(
+            go.Image(z=image_np),
+            row=1, col=1
+        )
 
         # Imagem com Grad-CAM
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[1].axis('off')
+        fig.add_trace(
+            go.Image(z=np.array(result)),
+            row=1, col=2
+        )
 
         # Imagem com Segmentação
-        ax[2].imshow(image_np)
-        ax[2].imshow(segmentation_colored, alpha=0.6)
-        ax[2].set_title('Segmentação')
-        ax[2].axis('off')
+        fig.add_trace(
+            go.Image(z=image_np),
+            row=1, col=3
+        )
+        fig.add_trace(
+            go.Image(z=segmentation_colored, opacity=0.6),
+            row=1, col=3
+        )
 
-        # Exibir as imagens com o Streamlit
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
+        fig.update_layout(
+            title_text="Visualização das Ativações e Segmentação",
+            showlegend=False,
+            width=1200,
+            height=400,
+            template='plotly_white'
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
     else:
         # Exibir as imagens: Imagem Original e Grad-CAM
-        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+        fig = make_subplots(rows=1, cols=2, subplot_titles=("Imagem Original", "Grad-CAM"))
 
         # Imagem original
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[0].axis('off')
+        fig.add_trace(
+            go.Image(z=image_np),
+            row=1, col=1
+        )
 
         # Imagem com Grad-CAM
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[1].axis('off')
+        fig.add_trace(
+            go.Image(z=np.array(result)),
+            row=1, col=2
+        )
 
-        # Exibir as imagens com o Streamlit
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
+        fig.update_layout(
+            title_text="Visualização das Ativações",
+            showlegend=False,
+            width=800,
+            height=400,
+            template='plotly_white'
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
 
 def train_quantum_model(
     epochs=3, 
@@ -976,7 +1052,7 @@ def train_quantum_model(
     """
     Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
     Possibilita a integração com hardware quântico real via Qiskit (opcional).
-
+    
     Retorna o modelo Keras treinado, histórico, resultados e backend utilizado.
     """
     # 1) Carregar MNIST e filtrar dígitos 3 e 6
@@ -1326,7 +1402,7 @@ def main():
                     st.success("Treinamento concluído!")
 
                     # Opção para baixar o modelo treinado
-                    st.write("Faça o download do modelo treinado:")
+                    st.write("### Faça o Download do Modelo Treinado:")
                     buffer = io.BytesIO()
                     torch.save(model.state_dict(), buffer)
                     buffer.seek(0)
@@ -1369,22 +1445,37 @@ def main():
                         st.success("Treinamento do modelo quântico concluído!")
 
                         # Exibir resultados
-                        st.write("**Resultados de Teste (Loss, Hinge Accuracy):**", q_results)
+                        st.write("### Resultados de Teste (Loss, Hinge Accuracy):")
+                        st.write(f"Loss: {q_results[0]:.4f}, Hinge Accuracy: {q_results[1]:.4f}")
 
-                        # Plotar histórico de perda
-                        fig, ax = plt.subplots()
-                        ax.plot(q_history.history['loss'], label='Treino')
-                        ax.plot(q_history.history['val_loss'], label='Validação')
-                        ax.set_title("Evolução da Perda (QNN)")
-                        ax.set_xlabel("Épocas")
-                        ax.set_ylabel("Perda")
-                        ax.legend()
-                        st.pyplot(fig)
-                        plt.close(fig)
+                        # Plotar histórico de perda usando Plotly
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=list(range(1, len(q_history.history['loss']) + 1)),
+                            y=q_history.history['loss'],
+                            mode='lines+markers',
+                            name='Perda de Treino',
+                            line=dict(color='blue')
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=list(range(1, len(q_history.history['val_loss']) + 1)),
+                            y=q_history.history['val_loss'],
+                            mode='lines+markers',
+                            name='Perda de Validação',
+                            line=dict(color='red')
+                        ))
+                        fig.update_layout(
+                            title='Evolução da Perda (QNN)',
+                            xaxis_title='Épocas',
+                            yaxis_title='Perda',
+                            legend=dict(x=0, y=1.1, orientation='h'),
+                            template='plotly_white'
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
                         # Salvar o modelo quântico
                         q_model.save("quantum_model.h5")
-                        st.write("Modelo quântico salvo como `quantum_model.h5`.")
+                        st.write("### Modelo Quântico Salvo como `quantum_model.h5`.")
 
                         # Salvar as classes em um arquivo
                         # Como o treinamento quântico foi feito com MNIST 3 vs. 6, as classes são fixas
@@ -1475,7 +1566,7 @@ def main():
                     st.write(f"**Confiança (Quântico):** {confidence_q:.4f}")
 
                     # Visualizar ativações - Grad-CAM não está implementado para modelos quânticos
-                    st.write("Visualização de ativações não está disponível para o modo quântico.")
+                    st.write("**Visualização de Ativações:** Não disponível para o modo quântico.")
 
     st.write("### Documentação dos Procedimentos")
     st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
@@ -1560,6 +1651,9 @@ def train_segmentation_model(images_dir, masks_dir, num_classes):
         st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Validação: {val_loss:.4f}')
 
     return model
+
+# Função auxiliar para criar subplots do Plotly
+from plotly.subplots import make_subplots
 
 # Executar a aplicação
 if __name__ == "__main__":
