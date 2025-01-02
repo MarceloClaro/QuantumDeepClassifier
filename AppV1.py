@@ -20,7 +20,7 @@ import logging
 from datetime import datetime
 import gc
 from sklearn.decomposition import PCA
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, roc_auc_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, roc_auc_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.preprocessing import label_binarize, MinMaxScaler
 from sklearn.cluster import KMeans, AgglomerativeClustering
 
@@ -155,17 +155,6 @@ def prepare_quantum_data(train_df, valid_df, test_df, n_qubits):
     
     return train_features_scaled, valid_features_scaled, test_features_scaled, pca, scaler
 
-def build_quantum_model(n_qubits, n_layers, symbols, observables):
-    """
-    Constrói o modelo quântico utilizando TensorFlow Quantum.
-    """
-    readout = tf.keras.layers.Dense(1, activation='sigmoid')
-    inputs = tf.keras.Input(shape=(), dtype=tf.string)
-    x = tfq.layers.PQC(tfq.convert_to_tensor([cirq.Circuit() for _ in range(len(symbols))]), observables)(inputs)
-    outputs = readout(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    return model
-
 def train_quantum_model(
     train_features_scaled, 
     train_labels, 
@@ -291,6 +280,8 @@ def visualize_data(dataset, classes):
     num_classes = len(classes)
     num_images = min(5, len(dataset.classes))
     fig, axes = plt.subplots(nrows=num_classes, ncols=num_images, figsize=(15, 3 * num_classes))
+    if num_classes == 1:
+        axes = np.expand_dims(axes, axis=0)
     for cls in range(num_classes):
         cls_idx = [i for i, label in enumerate(dataset.targets) if label == cls]
         sampled_idx = random.sample(cls_idx, min(num_images, len(cls_idx)))
@@ -622,7 +613,7 @@ def perform_clustering(model, dataloader, classes):
     st.write(f"**KMeans** - ARI: {ari_kmeans:.4f}, NMI: {nmi_kmeans:.4f}")
     st.write(f"**Agglomerative Clustering** - ARI: {ari_agglo:.4f}, NMI: {nmi_agglo:.4f}")
 
-def visualize_activations(model, image, classes, model_name, segmentation_model=None, segmentation=False):
+def visualize_activations(model, image, classes, model_name, test_transforms, segmentation_model=None, segmentation=False):
     """
     Visualiza as ativações do modelo utilizando Grad-CAM.
     """
@@ -672,6 +663,23 @@ def train_segmentation_model(images_dir, masks_dir, num_classes):
     st.write("**Treinamento do modelo de segmentação não implementado.**")
     # Aqui você deve implementar o treinamento do modelo de segmentação conforme necessário
     return None
+
+# Definir as transformações para treinamento e teste
+train_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],  # Média do ImageNet
+                         [0.229, 0.224, 0.225])  # Desvio padrão do ImageNet
+])
+
+test_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],  # Média do ImageNet
+                         [0.229, 0.224, 0.225])  # Desvio padrão do ImageNet
+])
 
 # Função Principal
 
@@ -1092,12 +1100,207 @@ def main():
                         st.error("Estrutura de diretórios inválida no arquivo ZIP. Certifique-se de que as imagens estão em 'images/' e as máscaras em 'masks/'.")
             elif mode == "Quântico (TFQ)":
                 if n_qubits >= 2 and n_qubits <= 10:
-                    # Aqui você pode implementar o treinamento quântico com os dados fornecidos
-                    st.write("**Treinamento do modelo quântico ainda não implementado para upload de dados.**")
-                    # Placeholder para a funcionalidade de upload de dados quânticos
+                    # Implementação do treinamento quântico
+                    temp_dir = tempfile.mkdtemp()
+                    zip_path = os.path.join(temp_dir, "uploaded.zip")
+                    with open(zip_path, "wb") as f:
+                        f.write(zip_file.read())
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # Verificar subdiretórios
+                    expected_dirs = ['images']
+                    found_dirs = {}
+                    for root, dirs, files in os.walk(temp_dir):
+                        for d in dirs:
+                            if d.lower() in expected_dirs:
+                                found_dirs[d.lower()] = os.path.join(root, d)
+                    
+                    if 'images' in found_dirs:
+                        images_dir = found_dirs['images']
+                        # Para classificação quântica, máscaras não são necessárias
+
+                        # Carregar o dataset de classificação
+                        st.write("Carregando o dataset de classificação...")
+                        try:
+                            full_dataset = datasets.ImageFolder(root=images_dir, transform=test_transforms)
+                        except Exception as e:
+                            st.error(f"Erro ao carregar o dataset de classificação: {e}")
+                            shutil.rmtree(temp_dir)
+                            return
+
+                        if len(full_dataset.classes) < 2:
+                            st.error("O dataset deve conter pelo menos duas classes para classificação quântica.")
+                            shutil.rmtree(temp_dir)
+                            return
+
+                        # Divisão dos dados
+                        dataset_size = len(full_dataset)
+                        indices = list(range(dataset_size))
+                        np.random.shuffle(indices)
+
+                        train_end = int(0.7 * dataset_size)
+                        valid_end = int(0.85 * dataset_size)
+
+                        train_indices = indices[:train_end]
+                        valid_indices = indices[train_end:valid_end]
+                        test_indices = indices[valid_end:]
+
+                        # Verificar se há dados suficientes em cada conjunto
+                        if len(train_indices) == 0 or len(valid_indices) == 0 or len(test_indices) == 0:
+                            st.error("Divisão dos dados resultou em um conjunto vazio. Ajuste os percentuais de divisão.")
+                            shutil.rmtree(temp_dir)
+                            return
+
+                        # Criar datasets para treino, validação e teste
+                        train_dataset_subset = torch.utils.data.Subset(full_dataset, train_indices)
+                        valid_dataset_subset = torch.utils.data.Subset(full_dataset, valid_indices)
+                        test_dataset_subset = torch.utils.data.Subset(full_dataset, test_indices)
+
+                        # Criar dataframes para os conjuntos de treinamento, validação e teste com data augmentation e embeddings
+                        model_for_embeddings = get_model('ResNet18', num_classes=len(full_dataset.classes), fine_tune=False, seed=42)  # Usando ResNet18 para embeddings
+                        if model_for_embeddings is None:
+                            st.error("Erro ao carregar o modelo para extração de embeddings.")
+                            shutil.rmtree(temp_dir)
+                            return
+
+                        st.write("**Processando o Conjunto de Treinamento para Inclusão de Data Augmentation e Embeddings...**")
+                        train_df = apply_transforms_and_get_embeddings(train_dataset_subset, model_for_embeddings, train_transforms, batch_size=batch_size_q, seed=42)
+                        st.write("**Processando o Conjunto de Validação...**")
+                        valid_df = apply_transforms_and_get_embeddings(valid_dataset_subset, model_for_embeddings, test_transforms, batch_size=batch_size_q, seed=42)
+                        st.write("**Processando o Conjunto de Teste...**")
+                        test_df = apply_transforms_and_get_embeddings(test_dataset_subset, model_for_embeddings, test_transforms, batch_size=batch_size_q, seed=42)
+
+                        # Mapear rótulos para nomes de classes
+                        class_to_idx = full_dataset.class_to_idx
+                        idx_to_class = {v: k for k, v in class_to_idx.items()}
+
+                        train_df['class_name'] = train_df['label'].map(idx_to_class)
+                        valid_df['class_name'] = valid_df['label'].map(idx_to_class)
+                        test_df['class_name'] = test_df['label'].map(idx_to_class)
+
+                        # Exibir dataframes no Streamlit sem a coluna 'augmented_image' e sem limitar a 5 linhas
+                        st.write("### Dataframe do Conjunto de Treinamento com Data Augmentation e Embeddings:")
+                        st.dataframe(train_df.drop(columns=['augmented_image']))
+
+                        st.write("### Dataframe do Conjunto de Validação:")
+                        st.dataframe(valid_df.drop(columns=['augmented_image']))
+
+                        st.write("### Dataframe do Conjunto de Teste:")
+                        st.dataframe(test_df.drop(columns=['augmented_image']))
+
+                        # Exibir todas as imagens augmentadas (ou limitar conforme necessário)
+                        display_all_augmented_images(train_df, full_dataset.classes, max_images=100)  # Ajuste 'max_images' conforme necessário
+
+                        # Visualizar os embeddings
+                        visualize_embeddings(train_df, full_dataset.classes)
+
+                        # Exibir contagem de imagens por classe nos conjuntos de treinamento e teste
+                        st.write("### Distribuição das Classes no Conjunto de Treinamento:")
+                        train_class_counts = train_df['class_name'].value_counts()
+                        fig = px.bar(
+                            train_class_counts, 
+                            x=train_class_counts.index, 
+                            y=train_class_counts.values,
+                            labels={'x': 'Classe', 'y': 'Número de Imagens'},
+                            title='Distribuição das Classes no Conjunto de Treinamento'
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.write("### Distribuição das Classes no Conjunto de Teste:")
+                        test_class_counts = test_df['class_name'].value_counts()
+                        fig = px.bar(
+                            test_class_counts, 
+                            x=test_class_counts.index, 
+                            y=test_class_counts.values,
+                            labels={'x': 'Classe', 'y': 'Número de Imagens'},
+                            title='Distribuição das Classes no Conjunto de Teste'
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        # Preparar dados para o modelo quântico
+                        st.write("**Preparando os dados para o modelo quântico...**")
+                        train_features_scaled, valid_features_scaled, test_features_scaled, pca, scaler = prepare_quantum_data(train_df, valid_df, test_df, n_qubits)
+
+                        # Map labels para binário se for classificação binária
+                        if len(full_dataset.classes) == 2:
+                            train_labels_bin = (train_df['label'] == 1).astype(int).values
+                            valid_labels_bin = (valid_df['label'] == 1).astype(int).values
+                            test_labels_bin = (test_df['label'] == 1).astype(int).values
+                        else:
+                            st.error("A classificação quântica atualmente suporta apenas classificação binária.")
+                            shutil.rmtree(temp_dir)
+                            return
+
+                        # Treinar o modelo quântico
+                        st.write("**Iniciando o treinamento do modelo quântico...**")
+                        quantum_model, history = train_quantum_model(
+                            train_features_scaled=train_features_scaled, 
+                            train_labels=train_labels_bin, 
+                            valid_features_scaled=valid_features_scaled, 
+                            valid_labels=valid_labels_bin, 
+                            n_qubits=n_qubits, 
+                            n_layers=n_layers, 
+                            epochs=epochs_q, 
+                            batch_size=batch_size_q, 
+                            learning_rate=learning_rate_q, 
+                            optimizer_type=optimizer_type_q,
+                            seed=42
+                        )
+
+                        if quantum_model is None:
+                            st.error("Erro no treinamento do modelo quântico.")
+                            shutil.rmtree(temp_seg_dir)
+                            return
+
+                        st.success("Treinamento do modelo quântico concluído!")
+
+                        # Armazenar o modelo quântico no session_state
+                        st.session_state['quantum_model'] = quantum_model
+                        st.session_state['quantum_circuit'] = create_quantum_circuit(n_qubits, n_layers)[0]
+                        st.session_state['quantum_symbols'] = create_quantum_circuit(n_qubits, n_layers)[1]
+                        st.session_state['pca'] = pca
+                        st.session_state['scaler'] = scaler
+
+                        # Opção para baixar o modelo quântico treinado
+                        st.write("### Faça o Download do Modelo Quântico Treinado:")
+                        quantum_buffer = io.BytesIO()
+                        quantum_model.save(quantum_buffer, save_format='h5')
+                        quantum_buffer.seek(0)
+                        st.download_button(
+                            label="Download do Modelo Quântico",
+                            data=quantum_buffer,
+                            file_name="modelo_quântico_treinado.h5",
+                            mime="application/octet-stream",
+                            key="download_quantum_model_button"
+                        )
+
+                        # Salvar as classes em um arquivo quântico
+                        classes_q_data = "\n".join(full_dataset.classes)
+                        st.download_button(
+                            label="Download das Classes",
+                            data=classes_q_data,
+                            file_name="classes_quantic.txt",
+                            mime="text/plain",
+                            key="download_classes_quantic_button"
+                        )
+
+                        # Visualizar os históricos de treinamento
+                        st.write("### Histórico de Treinamento do Modelo Quântico:")
+                        st.write(pd.DataFrame(history.history))
+
+                        # Liberar memória
+                        del train_dataset_subset, valid_dataset_subset, test_dataset_subset
+                        del train_circuits, valid_circuits
+                        gc.collect()
+
+                        # Limpar o diretório temporário
+                        shutil.rmtree(temp_dir)
+                    else:
+                        st.error("Estrutura de diretórios inválida no arquivo ZIP. Certifique-se de que as imagens estão em 'images/'.")
                 else:
                     st.error("O número de qubits deve estar entre 2 e 10 para o treinamento quântico.")
-    
+
     # Avaliação de uma imagem individual
     st.header("Avaliação de Imagem")
     evaluate = st.radio(
@@ -1149,6 +1352,7 @@ def main():
                         eval_image, 
                         classes_eval, 
                         model_name_eval, 
+                        test_transforms=test_transforms,
                         segmentation_model=segmentation_model, 
                         segmentation=segmentation
                     )
