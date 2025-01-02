@@ -312,7 +312,7 @@ def display_all_augmented_images(df, class_names, max_images=None):
                 image = df.iloc[idx]['augmented_image']
                 label = df.iloc[idx]['label']
                 with cols[col]:
-                    st.image(image, caption=class_names[label], use_column_width=True)
+                    st.image(image, caption=class_names[label], use_container_width=True)  # Substituído aqui
 
 def visualize_embeddings(df, class_names):
     """
@@ -1056,7 +1056,7 @@ def main():
     # Layout da página
     if os.path.exists('capa.png'):
         try:
-            st.image('capa.png', width=100, caption='Laboratório de Educação e Inteligência Artificial - Geomaker. "A melhor forma de prever o futuro é inventá-lo." - Alan Kay', use_container_width=True)
+            st.image('capa.png', caption='Laboratório de Educação e Inteligência Artificial - Geomaker. "A melhor forma de prever o futuro é inventá-lo." - Alan Kay', use_container_width=True)  # Substituído aqui
         except UnidentifiedImageError:
             st.warning("Imagem 'capa.png' não pôde ser carregada ou está corrompida.")
     else:
@@ -1242,7 +1242,7 @@ def main():
                 st.error(f"Erro ao abrir a imagem: {e}")
                 return
 
-            st.image(eval_image, caption='Imagem para avaliação', use_container_width=True)
+            st.image(eval_image, caption='Imagem para avaliação', use_container_width=True)  # Substituído aqui
 
             if mode == "Clássico (PyTorch)":
                 # Verificar se o modelo já foi carregado ou treinado
