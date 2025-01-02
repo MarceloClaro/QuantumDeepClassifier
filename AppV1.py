@@ -1593,6 +1593,38 @@ def main():
                     # Visualizar ativações - Grad-CAM não está implementado para modelos quânticos
                     st.write("**Visualização de Ativações:** Não disponível para o modo quântico.")
 
+    # Visualização de Circuitos Quânticos
+    st.header("Gerador e Visualizador de Circuitos Quânticos")
+    st.write("Selecione o tipo de circuito quântico que deseja gerar e visualize-o abaixo.")
+
+    # Seleção do tipo de circuito
+    circuit_type_display = st.selectbox(
+        "Selecione o Tipo de Circuito:",
+        options=["Basic", "Entangling", "Rotation"],
+        index=0,
+        key="circuit_type_display"
+    )
+
+    # Botão para gerar o circuito
+    if st.button("Gerar Circuito Quântico"):
+        with st.spinner("Gerando o circuito quântico..."):
+            circuit_display, readout_display = create_quantum_model(circuit_type_display)
+        
+        if circuit_display is not None:
+            st.write(f"### Circuito Selecionado: **{circuit_type_display}**")
+            visualize_circuit(circuit_display)
+        else:
+            st.error("Falha ao gerar o circuito quântico.")
+
+    # Opcional: Mostrar o código do circuito
+    if st.checkbox("Mostrar Código do Circuito Quântico"):
+        circuit_display, readout_display = create_quantum_model(circuit_type_display)
+        if circuit_display is not None:
+            st.code(str(circuit_display), language='python')
+        else:
+            st.error("Nenhum código para exibir.")
+
+    # Documentação dos Procedimentos
     st.write("### Documentação dos Procedimentos")
     st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
 
