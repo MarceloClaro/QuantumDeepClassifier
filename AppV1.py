@@ -1,571 +1,463 @@
-import os
-import zipfile
-import shutil
-import tempfile
-import random
+
+
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import matplotlib.pyplot as plt
-import seaborn as sns
 from PIL import Image, UnidentifiedImageError
-import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import transforms, datasets
-from torchvision.models import resnet18, resnet50, densenet121
-from torchvision.models import ResNet18_Weights, ResNet50_Weights, DenseNet121_Weights
-from torchvision.models.segmentation import fcn_resnet50, FCN_ResNet50_Weights
-from sklearn.cluster import AgglomerativeClustering, KMeans
-from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
-                             confusion_matrix, classification_report,
-                             roc_auc_score, roc_curve)
-from sklearn.preprocessing import label_binarize
-from sklearn.decomposition import PCA
-import streamlit as st
-import gc
-import logging
-import base64
-from torchcam.methods import SmoothGradCAMpp
-from torchcam.utils import overlay_mask
-from torchvision.transforms.functional import to_pil_image
-import cv2
 import io
-import warnings
+import zipfile
+import tempfile
+import shutil
+import os
+import random
+import logging
 from datetime import datetime
+import gc
+from sklearn.decomposition import PCA
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, roc_auc_score
+from sklearn.preprocessing import label_binarize, MinMaxScaler
+from sklearn.cluster import KMeans, AgglomerativeClustering
+
+# Importações para TensorFlow Quantum
 import tensorflow as tf
 import tensorflow_quantum as tfq
 import cirq
 import sympy
 
-# Configuração do dispositivo (CPU ou GPU)
+# Configurar o dispositivo (GPU se disponível)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Suprimir avisos desnecessários
-warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.classes.*")
+# Configurar o log
+logging.basicConfig(level=logging.INFO)
 
-# Configuração de estilo para gráficos
-sns.set_style('whitegrid')
+# Funções Auxiliares
 
 def set_seed(seed):
     """
-    Define uma seed para garantir a reprodutibilidade.
+    Define a seed para reprodução.
     """
-    random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-set_seed(42)  # Define a seed inicial
-
-# Função para configurar seed em cada worker de DataLoader
 def seed_worker(worker_id):
     """
-    Define a seed em cada worker do DataLoader.
+    Função para inicializar seeds nos workers do DataLoader.
     """
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-# Função para exibir imagens do conjunto de dados
+def get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False, seed=42):
+    """
+    Carrega um modelo pré-treinado e ajusta a última camada para o número de classes.
+    """
+    set_seed(seed)
+    try:
+        if model_name == 'ResNet18':
+            model = models.resnet18(pretrained=True)
+            num_ftrs = model.fc.in_features
+            model.fc = nn.Linear(num_ftrs, num_classes)
+        elif model_name == 'ResNet50':
+            model = models.resnet50(pretrained=True)
+            num_ftrs = model.fc.in_features
+            model.fc = nn.Linear(num_ftrs, num_classes)
+        elif model_name == 'DenseNet121':
+            model = models.densenet121(pretrained=True)
+            num_ftrs = model.classifier.in_features
+            model.classifier = nn.Linear(num_ftrs, num_classes)
+        else:
+            st.error("Modelo pré-treinado não suportado.")
+            return None
+
+        if not fine_tune:
+            for param in model.parameters():
+                param.requires_grad = False
+
+        model = model.to(device)
+        return model
+    except Exception as e:
+        st.error(f"Erro ao carregar o modelo: {e}")
+        return None
+
+def create_quantum_circuit(n_qubits, n_layers):
+    """
+    Cria um circuito quântico parametrizado.
+    """
+    qubits = cirq.GridQubit.rect(1, n_qubits)
+    circuit = cirq.Circuit()
+    symbols = sympy.symbols(f'x0:{n_qubits * n_layers}')
+    
+    for layer in range(n_layers):
+        for i in range(n_qubits):
+            circuit.append(cirq.ry(symbols[layer * n_qubits + i])(qubits[i]))
+        # Entangling layer
+        for i in range(n_qubits - 1):
+            circuit.append(cirq.CNOT(qubits[i], qubits[i+1]))
+    
+    return circuit, symbols
+
+def convert_features_to_circuits(features, circuit, symbols):
+    """
+    Converte features numéricas em circuitos quânticos aplicando os parâmetros.
+    """
+    circuits = []
+    for feature in features:
+        parameter_values = feature.tolist()
+        parametrized_circuit = cirq.resolve_parameters(circuit, dict(zip(symbols, parameter_values)))
+        circuits.append(parametrized_circuit)
+    return tfq.convert_to_tensor(circuits)
+
+def build_quantum_model(n_qubits, n_layers, symbols, observables):
+    """
+    Constrói o modelo quântico utilizando TensorFlow Quantum.
+    """
+    readout = tf.keras.layers.Dense(1, activation='sigmoid')
+    inputs = tf.keras.Input(shape=(), dtype=tf.string)
+    x = tfq.layers.PQC(tfq.convert_to_tensor([cirq.Circuit() for _ in range(len(symbols))]), observables)(inputs)
+    outputs = readout(x)
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+def prepare_quantum_data(train_df, valid_df, test_df, n_qubits):
+    """
+    Aplica PCA nos embeddings e prepara os dados para o modelo quântico.
+    
+    Retorna os dados transformados e os objetos PCA e scaler.
+    """
+    # Combinar os dados de treino e validação para ajustar o PCA
+    combined_features = np.vstack([train_df.drop(columns=['label', 'augmented_image']),
+                                   valid_df.drop(columns=['label', 'augmented_image'])])
+    
+    # Aplicar PCA para reduzir a dimensionalidade para o número de qubits
+    pca = PCA(n_components=n_qubits)
+    pca.fit(combined_features)
+    
+    # Transformar os conjuntos de dados
+    train_features_pca = pca.transform(train_df.drop(columns=['label', 'augmented_image']))
+    valid_features_pca = pca.transform(valid_df.drop(columns=['label', 'augmented_image']))
+    test_features_pca = pca.transform(test_df.drop(columns=['label', 'augmented_image']))
+    
+    # Escalar os dados para [0, π]
+    scaler = MinMaxScaler(feature_range=(0, np.pi))
+    scaler.fit(train_features_pca)
+    
+    train_features_scaled = scaler.transform(train_features_pca)
+    valid_features_scaled = scaler.transform(valid_features_pca)
+    test_features_scaled = scaler.transform(test_features_pca)
+    
+    return train_features_scaled, valid_features_scaled, test_features_scaled, pca, scaler
+
+def build_quantum_model(n_qubits, n_layers, symbols, observables):
+    """
+    Constrói o modelo quântico utilizando TensorFlow Quantum.
+    """
+    readout = tf.keras.layers.Dense(1, activation='sigmoid')
+    inputs = tf.keras.Input(shape=(), dtype=tf.string)
+    x = tfq.layers.PQC(tfq.convert_to_tensor([cirq.Circuit() for _ in range(len(symbols))]), observables)(inputs)
+    outputs = readout(x)
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+def train_quantum_model(
+    train_features_scaled, 
+    train_labels, 
+    valid_features_scaled, 
+    valid_labels, 
+    n_qubits, 
+    n_layers, 
+    epochs=10, 
+    batch_size=32, 
+    learning_rate=0.01, 
+    optimizer_type='Adam',
+    seed=42
+):
+    """
+    Treina um modelo quântico utilizando TFQ.
+    
+    Retorna o modelo quântico treinado e o histórico de treinamento.
+    """
+    set_seed(seed)
+    
+    # Definir qubits e circuitos
+    circuit, symbols = create_quantum_circuit(n_qubits, n_layers)
+    observables = [cirq.Z(qubit) for qubit in cirq.GridQubit.rect(1, n_qubits)]
+    
+    # Construir modelo quântico
+    quantum_model = build_quantum_model(n_qubits, n_layers, symbols, observables)
+    
+    # Selecionar o otimizador
+    if optimizer_type == 'Adam':
+        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    elif optimizer_type == 'SGD':
+        optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate)
+    elif optimizer_type == 'RMSprop':
+        optimizer = tf.keras.optimizers.RMSprop(learning_rate=learning_rate)
+    else:
+        st.error("Tipo de otimizador não suportado.")
+        return None, None
+    
+    # Compilar o modelo
+    quantum_model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    # Converter features para circuitos
+    train_circuits = convert_features_to_circuits(train_features_scaled, circuit, symbols)
+    valid_circuits = convert_features_to_circuits(valid_features_scaled, circuit, symbols)
+    
+    # Treinar o modelo
+    history = quantum_model.fit(
+        train_circuits,
+        train_labels,
+        validation_data=(valid_circuits, valid_labels),
+        epochs=epochs,
+        batch_size=batch_size
+    )
+    
+    return quantum_model, history
+
+def evaluate_image(model, image, classes, pca=None, scaler=None, quantum=False):
+    """
+    Avalia uma única imagem usando o modelo treinado.
+    
+    Se quantum=True, utiliza o modelo quântico com PCA e scaler.
+    """
+    if not quantum:
+        # Modelo clássico
+        model.eval()
+        with torch.no_grad():
+            image_tensor = test_transforms(image).unsqueeze(0).to(device)
+            outputs = model(image_tensor)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            confidence, preds = torch.max(probabilities, 1)
+            predicted_class = classes[preds.item()]
+            confidence = confidence.item()
+        return predicted_class, confidence
+    else:
+        # Modelo quântico
+        if 'quantum_model' not in st.session_state or 'quantum_circuit' not in st.session_state or 'quantum_symbols' not in st.session_state:
+            st.error("Modelo quântico não carregado corretamente.")
+            return None, None
+        quantum_model = st.session_state['quantum_model']
+        quantum_circuit = st.session_state['quantum_circuit']
+        quantum_symbols = st.session_state['quantum_symbols']
+        pca = st.session_state['pca']
+        scaler = st.session_state['scaler']
+        
+        # Extrair features com o modelo clássico
+        with torch.no_grad():
+            model_for_embeddings = st.session_state['model']
+            model_for_embeddings.eval()
+            image_tensor = test_transforms(image).unsqueeze(0).to(device)
+            features = model_for_embeddings(image_tensor).cpu().numpy()
+        
+        # Aplicar PCA e Escalonamento
+        features_pca = pca.transform(features)
+        features_scaled = scaler.transform(features_pca)
+        
+        # Converter features para circuitos quânticos
+        circuits = convert_features_to_circuits(features_scaled, quantum_circuit, quantum_symbols)
+        
+        # Fazer a previsão
+        y_pred = quantum_model.predict(circuits)
+        
+        # Interpretar a saída
+        predicted_label = int(y_pred[0][0] > 0.5)
+        confidence = y_pred[0][0]
+        
+        # Obter o nome da classe
+        if predicted_label >= len(classes):
+            class_name = "Desconhecida"
+        else:
+            class_name = classes[predicted_label]
+        
+        return class_name, confidence
+
 def visualize_data(dataset, classes):
     """
-    Exibe amostras do conjunto de dados com as classes correspondentes.
+    Visualiza algumas imagens de cada classe.
     """
-    st.write("Visualização de amostras do conjunto de dados:")
-    fig, axes = plt.subplots(1, 10, figsize=(20, 4))
-    for i in range(10):
-        idx = np.random.randint(len(dataset))
-        image, label = dataset[idx]
-        image = np.array(image)
-        axes[i].imshow(image)
-        axes[i].set_title(classes[label])
-        axes[i].axis('off')
+    st.write("### Visualização de Imagens das Classes")
+    num_classes = len(classes)
+    num_images = min(5, len(dataset.classes))
+    fig, axes = plt.subplots(nrows=num_classes, ncols=num_images, figsize=(15, 3 * num_classes))
+    for cls in range(num_classes):
+        cls_idx = [i for i, label in enumerate(dataset.targets) if label == cls]
+        sampled_idx = random.sample(cls_idx, min(num_images, len(cls_idx)))
+        for i, idx in enumerate(sampled_idx):
+            img, label = dataset[idx]
+            img = img.permute(1, 2, 0).numpy()
+            axes[cls, i].imshow(img)
+            axes[cls, i].axis('off')
+            if i == 0:
+                axes[cls, i].set_ylabel(classes[cls], fontsize=12)
+    plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
 
-# Função para exibir a distribuição de classes
 def plot_class_distribution(dataset, classes):
     """
-    Exibe a distribuição de classes no conjunto de dados.
+    Plota a distribuição de classes.
     """
-    labels = [label for _, label in dataset]
-    df = pd.DataFrame({'Classe': labels})
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.countplot(x='Classe', data=df, ax=ax, palette="Set2", dodge=False)
-    ax.set_xticks(range(len(classes)))
-    ax.set_xticklabels(classes, rotation=45)
-    ax.set_title("Distribuição de Classes")
-    ax.set_xlabel("Classes")
-    ax.set_ylabel("Quantidade")
-    st.pyplot(fig)
-    plt.close(fig)
+    st.write("### Distribuição das Classes")
+    class_counts = pd.Series(dataset.targets).value_counts().sort_index()
+    df = pd.DataFrame({'Classe': classes, 'Contagem': class_counts.values})
+    fig = px.bar(df, x='Classe', y='Contagem', title='Distribuição das Classes', template='plotly_white')
+    st.plotly_chart(fig, use_container_width=True)
 
-# Dataset personalizado para classificação
-class CustomDataset(torch.utils.data.Dataset):
+def apply_transforms_and_get_embeddings(dataset_subset, model_for_embeddings, transform, batch_size, seed):
     """
-    Classe para um conjunto de dados personalizado com transformações opcionais.
+    Aplica transformações ao dataset e extrai embeddings utilizando o modelo clássico.
+    Retorna um DataFrame com embeddings, rótulos e imagens augmentadas.
     """
-    def __init__(self, dataset, transform=None):
-        self.dataset = dataset
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        image, label = self.dataset[idx]
-        if self.transform:
-            image = self.transform(image)
-        return image, label
-
-# Dataset personalizado para segmentação
-class SegmentationDataset(torch.utils.data.Dataset):
-    """
-    Classe para conjuntos de dados de segmentação, incluindo imagens e máscaras.
-    """
-    def __init__(self, images_dir, masks_dir, transform=None, target_transform=None):
-        self.images_dir = images_dir
-        self.masks_dir = masks_dir
-        self.transform = transform
-        self.target_transform = target_transform
-        self.images = sorted(os.listdir(images_dir))
-        self.masks = sorted(os.listdir(masks_dir))
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.images_dir, self.images[idx])
-        mask_path = os.path.join(self.masks_dir, self.masks[idx])
-
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path)
-
-        if self.transform:
-            image = self.transform(image)
-
-        if self.target_transform:
-            mask = self.target_transform(mask)
-
-        return image, mask
-
-# Definir as transformações para aumento de dados (aplicando transformações aleatórias)
-train_transforms = transforms.Compose([
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(degrees=45),
-    transforms.RandomApply([
-        transforms.RandomRotation(degrees=(0, 360)),
-        transforms.RandomAffine(degrees=0, shear=10),
-        transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
-        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
-    ], p=0.5),
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-])
-
-# Transformações para validação e teste
-test_transforms = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-])
-def visualize_data(dataset, classes):
-    """
-    Exibe algumas imagens do conjunto de dados com suas classes.
-    """
-    st.write("Visualização de algumas imagens do conjunto de dados:")
-    fig, axes = plt.subplots(1, 10, figsize=(20, 4))
-    for i in range(10):
-        idx = np.random.randint(len(dataset))
-        image, label = dataset[idx]
-        image = np.array(image)  # Converter a imagem PIL em array NumPy
-        axes[i].imshow(image)
-        axes[i].set_title(classes[label])
-        axes[i].axis('off')
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-def plot_class_distribution(dataset, classes):
-    """
-    Exibe a distribuição das classes no conjunto de dados e mostra os valores quantitativos.
-    """
-    # Extrair os rótulos das classes para todas as imagens no dataset
-    labels = [label for _, label in dataset]
-
-    # Criar um DataFrame para facilitar o plot com Seaborn
-    df = pd.DataFrame({'Classe': labels})
-
-    # Plotar o gráfico com as contagens
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.countplot(x='Classe', data=df, ax=ax, palette="Set2", hue='Classe', dodge=False)
-
-    # Definir ticks e labels
-    ax.set_xticks(range(len(classes)))
-    ax.set_xticklabels(classes, rotation=45)
-
-    # Remover a legenda
-    ax.get_legend().remove()
-
-    # Adicionar as contagens acima das barras
-    class_counts = df['Classe'].value_counts().sort_index()
-    for i, count in enumerate(class_counts):
-        ax.text(i, count, str(count), ha='center', va='bottom', fontweight='bold')
-
-    ax.set_title("Distribuição das Classes (Quantidade de Imagens)")
-    ax.set_xlabel("Classes")
-    ax.set_ylabel("Número de Imagens")
-
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-def get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False):
-    """
-    Retorna o modelo pré-treinado selecionado para classificação.
-    """
-    if model_name == 'ResNet18':
-        weights = ResNet18_Weights.DEFAULT
-        model = resnet18(weights=weights)
-    elif model_name == 'ResNet50':
-        weights = ResNet50_Weights.DEFAULT
-        model = resnet50(weights=weights)
-    elif model_name == 'DenseNet121':
-        weights = DenseNet121_Weights.DEFAULT
-        model = densenet121(weights=weights)
-    else:
-        st.error("Modelo não suportado.")
-        return None
-
-    if not fine_tune:
-        for param in model.parameters():
-            param.requires_grad = False
-
-    # Modificar a última camada para o número de classes
-    if model_name.startswith('ResNet'):
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Sequential(
-            nn.Dropout(p=dropout_p),
-            nn.Linear(num_ftrs, num_classes)
-        )
-    elif model_name.startswith('DenseNet'):
-        num_ftrs = model.classifier.in_features
-        model.classifier = nn.Sequential(
-            nn.Dropout(p=dropout_p),
-            nn.Linear(num_ftrs, num_classes)
-        )
-    else:
-        st.error("Modelo não suportado.")
-        return None
-
-    model = model.to(device)
-    return model
-def get_segmentation_model(num_classes, fine_tune=False):
-    """
-    Retorna o modelo pré-treinado para segmentação.
-    """
-    weights = FCN_ResNet50_Weights.DEFAULT
-    model = fcn_resnet50(weights=weights)
-
-    if not fine_tune:
-        for param in model.parameters():
-            param.requires_grad = False
-
-    # Ajustar a última camada para suportar o número de classes
-    model.classifier[4] = nn.Conv2d(512, num_classes, kernel_size=1)
-    model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-    model = model.to(device)
-
-    return model
-def apply_transforms_and_get_embeddings(dataset, model, transform, batch_size=16):
-    """
-    Aplica as transformações às imagens, extrai os embeddings e retorna um DataFrame.
-    """
-    # Função personalizada de coleta
-    def pil_collate_fn(batch):
-        images, labels = zip(*batch)
-        return list(images), torch.tensor(labels)
-
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=pil_collate_fn)
-    embeddings_list = []
-    labels_list = []
-    file_paths_list = []
-    augmented_images_list = []
-
-    # Remover a última camada do modelo para extrair os embeddings
-    model_embedding = nn.Sequential(*list(model.children())[:-1])
-    model_embedding.eval()
-    model_embedding.to(device)
-
-    indices = dataset.indices if hasattr(dataset, 'indices') else list(range(len(dataset)))
-    index_pointer = 0  # Para rastrear os índices
-
+    dataloader = DataLoader(
+        dataset_subset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        worker_init_fn=seed_worker, 
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    embeddings = []
+    labels = []
+    augmented_images = []
+    
+    model_for_embeddings.eval()
+    model_for_embeddings.to(device)
+    
     with torch.no_grad():
-        for images, labels in data_loader:
-            images_augmented = [transform(img) for img in images]
-            images_augmented = torch.stack(images_augmented).to(device)
-            embeddings = model_embedding(images_augmented)
-            embeddings = embeddings.view(embeddings.size(0), -1).cpu().numpy()
-            embeddings_list.extend(embeddings)
-            labels_list.extend(labels.numpy())
-            augmented_images_list.extend([img.permute(1, 2, 0).numpy() for img in images_augmented.cpu()])
-            if hasattr(dataset, 'dataset') and hasattr(dataset.dataset, 'samples'):
-                batch_indices = indices[index_pointer:index_pointer + len(images)]
-                file_paths = [dataset.dataset.samples[i][0] for i in batch_indices]
-                file_paths_list.extend(file_paths)
-                index_pointer += len(images)
-            else:
-                file_paths_list.extend(['N/A'] * len(labels))
-
-    # Criar DataFrame com embeddings
-    df = pd.DataFrame({
-        'file_path': file_paths_list,
-        'label': labels_list,
-        'embedding': embeddings_list,
-        'augmented_image': augmented_images_list
-    })
-
+        for inputs, lbls in dataloader:
+            inputs = inputs.to(device)
+            outputs = model_for_embeddings(inputs)
+            embeddings.append(outputs.cpu().numpy())
+            labels.extend(lbls.numpy())
+            augmented_images.extend(inputs.cpu())
+    
+    embeddings = np.vstack(embeddings)
+    df = pd.DataFrame(embeddings, columns=[f'feat_{i}' for i in range(embeddings.shape[1])])
+    df['label'] = labels
+    df['augmented_image'] = augmented_images
     return df
-def display_all_augmented_images(df, class_names, max_images=None):
+
+def display_all_augmented_images(df, classes, max_images=100):
     """
-    Exibe todas as imagens aumentadas presentes no DataFrame.
+    Exibe todas as imagens augmentadas em um grid.
     """
-    if max_images is not None:
-        df = df.head(max_images)
-        st.write(f"**Visualização das Primeiras {max_images} Imagens após Data Augmentation:**")
-    else:
-        st.write("**Visualização de Todas as Imagens após Data Augmentation:**")
+    st.write(f"### Exibição de Até {max_images} Imagens Augmentadas")
+    images = df['augmented_image'].tolist()[:max_images]
+    num_cols = 5
+    num_rows = int(np.ceil(len(images) / num_cols))
+    fig = plt.figure(figsize=(15, 3 * num_rows))
+    for i, img_tensor in enumerate(images):
+        if i >= max_images:
+            break
+        image = img_tensor.permute(1, 2, 0).numpy()
+        ax = fig.add_subplot(num_rows, num_cols, i+1)
+        ax.imshow(image)
+        ax.axis('off')
+    st.pyplot(fig)
+    plt.close(fig)
 
-    num_images = len(df)
-    if num_images == 0:
-        st.write("Nenhuma imagem para exibir.")
-        return
-
-    cols_per_row = 5  # Número de colunas por linha
-    rows = (num_images + cols_per_row - 1) // cols_per_row  # Calcula o número de linhas necessárias
-
-    for row in range(rows):
-        cols = st.columns(cols_per_row)
-        for col in range(cols_per_row):
-            idx = row * cols_per_row + col
-            if idx < num_images:
-                image = df.iloc[idx]['augmented_image']
-                label = df.iloc[idx]['label']
-                with cols[col]:
-                    st.image(image, caption=class_names[label], use_column_width=True)
-
-
-def visualize_embeddings(df, class_names):
+def visualize_embeddings(df, classes):
     """
-    Reduz a dimensionalidade dos embeddings e os visualiza em 2D.
+    Visualiza os embeddings usando PCA.
     """
-    embeddings = np.vstack(df['embedding'].values)
-    labels = df['label'].values
-
-    # Redução de dimensionalidade com PCA
+    st.write("### Visualização dos Embeddings com PCA")
     pca = PCA(n_components=2)
-    embeddings_2d = pca.fit_transform(embeddings)
-
-    # Criar DataFrame para plotagem
-    plot_df = pd.DataFrame({
+    embeddings_2d = pca.fit_transform(df.drop(columns=['label', 'augmented_image']))
+    df_plot = pd.DataFrame({
         'PC1': embeddings_2d[:, 0],
         'PC2': embeddings_2d[:, 1],
-        'label': labels
+        'Classe': [classes[label] for label in df['label']]
     })
+    fig = px.scatter(
+        df_plot, 
+        x='PC1', 
+        y='PC2', 
+        color='Classe',
+        title='Embeddings Visualizados com PCA',
+        template='plotly_white'
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Plotar gráficos
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=plot_df, x='PC1', y='PC2', hue='label', palette='Set2', legend='full')
-
-    # Configurações do gráfico
-    plt.title('Visualização dos Embeddings com PCA')
-    plt.legend(title='Classes', labels=class_names)
-    plt.xlabel('Componente Principal 1')
-    plt.ylabel('Componente Principal 2')
-
-    # Exibir no Streamlit
-    st.pyplot(plt)
-    plt.close()  # Fechar para liberar memória
-def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience):
+def plot_metrics(train_losses, valid_losses, train_accuracies, valid_accuracies):
     """
-    Treina um modelo de classificação com as configurações fornecidas.
+    Plota os gráficos de perda e acurácia usando Plotly.
     """
-    set_seed(42)  # Garantir reprodutibilidade
+    epochs_range = list(range(1, len(train_losses) + 1))
+    fig = go.Figure()
 
-    # Carregar o dataset original
-    full_dataset = datasets.ImageFolder(root=data_dir)
+    # Perda de Treino
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=train_losses,
+        mode='lines+markers',
+        name='Perda de Treino',
+        line=dict(color='blue')
+    ))
 
-    # Validar número de classes
-    if len(full_dataset.classes) < num_classes:
-        st.error(f"O número de classes encontradas ({len(full_dataset.classes)}) é menor que o especificado ({num_classes}).")
-        return None
+    # Perda de Validação
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=valid_losses,
+        mode='lines+markers',
+        name='Perda de Validação',
+        line=dict(color='red')
+    ))
 
-    # Visualizar dados e distribuição de classes
-    visualize_data(full_dataset, full_dataset.classes)
-    plot_class_distribution(full_dataset, full_dataset.classes)
+    # Acurácia de Treino
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=train_accuracies,
+        mode='lines+markers',
+        name='Acurácia de Treino',
+        line=dict(color='green')
+    ))
 
-    # Divisão em treino, validação e teste
-    dataset_size = len(full_dataset)
-    indices = list(range(dataset_size))
-    np.random.shuffle(indices)
+    # Acurácia de Validação
+    fig.add_trace(go.Scatter(
+        x=epochs_range,
+        y=valid_accuracies,
+        mode='lines+markers',
+        name='Acurácia de Validação',
+        line=dict(color='orange')
+    ))
 
-    train_end = int(train_split * dataset_size)
-    valid_end = int((train_split + valid_split) * dataset_size)
+    fig.update_layout(
+        title='Perda e Acurácia por Época',
+        xaxis_title='Épocas',
+        yaxis_title='Valor',
+        legend=dict(x=0, y=1.2, orientation='h'),
+        template='plotly_white'
+    )
 
-    train_indices = indices[:train_end]
-    valid_indices = indices[train_end:valid_end]
-    test_indices = indices[valid_end:]
+    st.plotly_chart(fig, use_container_width=True)
 
-    if len(train_indices) == 0 or len(valid_indices) == 0 or len(test_indices) == 0:
-        st.error("Conjuntos de treino, validação ou teste ficaram vazios. Ajuste os percentuais.")
-        return None
-
-    # Datasets divididos
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    valid_dataset = torch.utils.data.Subset(full_dataset, valid_indices)
-    test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
-
-    # Criar embeddings e data augmentation para os conjuntos
-    model_for_embeddings = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False)
-    if model_for_embeddings is None:
-        return None
-
-    st.write("**Processando embeddings e Data Augmentation...**")
-    train_df = apply_transforms_and_get_embeddings(train_dataset, model_for_embeddings, train_transforms, batch_size=batch_size)
-    valid_df = apply_transforms_and_get_embeddings(valid_dataset, model_for_embeddings, test_transforms, batch_size=batch_size)
-    test_df = apply_transforms_and_get_embeddings(test_dataset, model_for_embeddings, test_transforms, batch_size=batch_size)
-
-    # Mapear classes
-    class_to_idx = full_dataset.class_to_idx
-    idx_to_class = {v: k for k, v in class_to_idx.items()}
-
-    train_df['class_name'] = train_df['label'].map(idx_to_class)
-    valid_df['class_name'] = valid_df['label'].map(idx_to_class)
-    test_df['class_name'] = test_df['label'].map(idx_to_class)
-
-    # Exibir dataframes e visualizações
-    st.write("**Dados do Treinamento:**")
-    st.dataframe(train_df.drop(columns=['augmented_image']))
-    display_all_augmented_images(train_df, full_dataset.classes, max_images=100)
-    visualize_embeddings(train_df, full_dataset.classes)
-
-    # Atualizar datasets
-    train_dataset = CustomDataset(torch.utils.data.Subset(full_dataset, train_indices), transform=train_transforms)
-    valid_dataset = CustomDataset(torch.utils.data.Subset(full_dataset, valid_indices), transform=test_transforms)
-    test_dataset = CustomDataset(torch.utils.data.Subset(full_dataset, test_indices), transform=test_transforms)
-
-    # Configurar DataLoader
-    g = torch.Generator()
-    g.manual_seed(42)
-
-    if use_weighted_loss:
-        targets = [full_dataset.targets[i] for i in train_indices]
-        class_counts = np.bincount(targets) + 1e-6
-        class_weights = 1.0 / class_counts
-        class_weights = torch.FloatTensor(class_weights).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-    else:
-        criterion = nn.CrossEntropyLoss()
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, worker_init_fn=seed_worker, generator=g)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker, generator=g)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker, generator=g)
-
-    # Preparar modelo
-    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=fine_tune)
-    if model is None:
-        return None
-
-    # Otimizador e regularização L2
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=l2_lambda)
-
-    # Configurações para treinamento
-    best_valid_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_wts = None
-
-    progress_bar = st.progress(0)
-    epoch_text = st.empty()
-
-    # Laço de treinamento
-    for epoch in range(epochs):
-        set_seed(42 + epoch)
-        model.train()
-
-        train_loss, train_corrects = 0.0, 0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item() * inputs.size(0)
-            train_corrects += torch.sum(preds == labels.data)
-
-        epoch_loss = train_loss / len(train_dataset)
-        epoch_acc = train_corrects.double() / len(train_dataset)
-
-        st.session_state.train_losses.append(epoch_loss)
-        st.session_state.train_accuracies.append(epoch_acc.item())
-
-        # Validação
-        model.eval()
-        valid_loss, valid_corrects = 0.0, 0
-
-        with torch.no_grad():
-            for inputs, labels in valid_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-
-                outputs = model(inputs)
-                _, preds = torch.max(outputs, 1)
-                loss = criterion(outputs, labels)
-
-                valid_loss += loss.item() * inputs.size(0)
-                valid_corrects += torch.sum(preds == labels.data)
-
-        valid_epoch_loss = valid_loss / len(valid_dataset)
-        valid_epoch_acc = valid_corrects.double() / len(valid_dataset)
-
-        st.session_state.valid_losses.append(valid_epoch_loss)
-        st.session_state.valid_accuracies.append(valid_epoch_acc.item())
-
-        # Atualizar progresso
-        progress_bar.progress((epoch + 1) / epochs)
-        epoch_text.text(f'Época {epoch+1}/{epochs}')
-
-        # Early Stopping
-        if valid_epoch_loss < best_valid_loss:
-            best_valid_loss = valid_epoch_loss
-            epochs_no_improve = 0
-            best_model_wts = model.state_dict()
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                st.write("Early stopping!")
-                break
-
-    # Carregar os melhores pesos do modelo
-    if best_model_wts:
-        model.load_state_dict(best_model_wts)
-
-    # Retornar modelo treinado
-    return model, full_dataset.classes
 def compute_metrics(model, dataloader, classes):
     """
-    Calcula métricas detalhadas, incluindo matriz de confusão, relatório de classificação e curva ROC.
+    Calcula métricas detalhadas e exibe matriz de confusão e relatório de classificação.
     """
     model.eval()
-    all_preds, all_labels, all_probs = [], [], []
+    all_preds = []
+    all_labels = []
+    all_probs = []
 
     with torch.no_grad():
         for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
             outputs = model(inputs)
             probabilities = torch.nn.functional.softmax(outputs, dim=1)
@@ -575,42 +467,47 @@ def compute_metrics(model, dataloader, classes):
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(probabilities.cpu().numpy())
 
-    # Relatório de classificação
+    # Relatório de Classificação
     report = classification_report(all_labels, all_preds, target_names=classes, output_dict=True)
-    st.text("Relatório de Classificação:")
+    st.text("### Relatório de Classificação:")
     st.write(pd.DataFrame(report).transpose())
 
-    # Matriz de confusão normalizada
+    # Matriz de Confusão Normalizada usando Plotly
     cm = confusion_matrix(all_labels, all_preds, normalize='true')
-    fig, ax = plt.subplots()
-    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', xticklabels=classes, yticklabels=classes, ax=ax)
-    ax.set_xlabel('Predito')
-    ax.set_ylabel('Verdadeiro')
-    ax.set_title('Matriz de Confusão Normalizada')
-    st.pyplot(fig)
-    plt.close(fig)
+    fig = px.imshow(
+        cm, 
+        text_auto=True, 
+        labels=dict(x="Predito", y="Verdadeiro", color="Proporção"),
+        x=classes, 
+        y=classes, 
+        title="Matriz de Confusão Normalizada",
+        color_continuous_scale='Blues'
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Curva ROC
+    # Curva ROC usando Plotly
     if len(classes) == 2:
         fpr, tpr, thresholds = roc_curve(all_labels, [p[1] for p in all_probs])
         roc_auc = roc_auc_score(all_labels, [p[1] for p in all_probs])
-        fig, ax = plt.subplots()
-        ax.plot(fpr, tpr, label='AUC = %0.2f' % roc_auc)
-        ax.plot([0, 1], [0, 1], 'k--')
-        ax.set_xlabel('Taxa de Falsos Positivos')
-        ax.set_ylabel('Taxa de Verdadeiros Positivos')
-        ax.set_title('Curva ROC')
-        ax.legend(loc='lower right')
-        st.pyplot(fig)
-        plt.close(fig)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'AUC = {roc_auc:.2f}'))
+        fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', name='Linha de Referência', line=dict(dash='dash')))
+        fig.update_layout(
+            title='Curva ROC',
+            xaxis_title='Taxa de Falsos Positivos',
+            yaxis_title='Taxa de Verdadeiros Positivos',
+            template='plotly_white'
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
+        # Multiclasse
         binarized_labels = label_binarize(all_labels, classes=range(len(classes)))
         roc_auc = roc_auc_score(binarized_labels, np.array(all_probs), average='weighted', multi_class='ovr')
-        st.write(f"AUC-ROC Média Ponderada: {roc_auc:.4f}")
+        st.write(f"**AUC-ROC Média Ponderada:** {roc_auc:.4f}")
 
 def error_analysis(model, dataloader, classes):
     """
-    Identifica e visualiza imagens mal classificadas.
+    Realiza análise de erros mostrando algumas imagens mal classificadas.
     """
     model.eval()
     misclassified_images = []
@@ -619,7 +516,8 @@ def error_analysis(model, dataloader, classes):
 
     with torch.no_grad():
         for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs = inputs.to(device)
+            labels = labels.to(device)
             outputs = model(inputs)
             _, preds = torch.max(outputs, 1)
 
@@ -632,27 +530,33 @@ def error_analysis(model, dataloader, classes):
                     break
 
     if misclassified_images:
-        st.write("Imagens mal classificadas:")
-        fig, axes = plt.subplots(1, min(5, len(misclassified_images)), figsize=(15, 3))
+        st.write("### Algumas Imagens Mal Classificadas:")
+        fig = plt.figure(figsize=(15, 3))
         for i in range(min(5, len(misclassified_images))):
             image = misclassified_images[i]
             image = image.permute(1, 2, 0).numpy()
-            axes[i].imshow(image)
-            axes[i].set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
-            axes[i].axis('off')
+            ax = fig.add_subplot(1, 5, i+1)
+            ax.imshow(image)
+            ax.set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
+            ax.axis('off')
         st.pyplot(fig)
         plt.close(fig)
     else:
         st.write("Nenhuma imagem mal classificada encontrada.")
+
 def perform_clustering(model, dataloader, classes):
     """
-    Realiza a extração de embeddings, reduz a dimensionalidade e aplica algoritmos de clusterização.
+    Realiza a extração de features e aplica algoritmos de clusterização.
     """
-    # Extrair embeddings usando o modelo treinado
-    features, labels = [], []
+    # Extrair features usando o modelo pré-treinado
+    features = []
+    labels = []
 
     # Remover a última camada (classificador)
-    model_feat = nn.Sequential(*list(model.children())[:-1]) if not isinstance(model, nn.Sequential) else model
+    if isinstance(model, nn.Sequential):
+        model_feat = model
+    else:
+        model_feat = nn.Sequential(*list(model.children())[:-1])
     model_feat.eval()
     model_feat.to(device)
 
@@ -679,23 +583,37 @@ def perform_clustering(model, dataloader, classes):
     agglo = AgglomerativeClustering(n_clusters=len(classes))
     clusters_agglo = agglo.fit_predict(features)
 
-    # Visualizar resultados
-    fig, ax = plt.subplots(1, 2, figsize=(14, 6))
+    # Criar DataFrame para Plotagem
+    cluster_df = pd.DataFrame({
+        'PC1': features_2d[:, 0],
+        'PC2': features_2d[:, 1],
+        'Cluster KMeans': clusters_kmeans,
+        'Cluster Agglomerative': clusters_agglo
+    })
 
-    # Clusterização KMeans
-    scatter = ax[0].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_kmeans, cmap='viridis')
-    legend1 = ax[0].legend(*scatter.legend_elements(), title="Clusters")
-    ax[0].add_artist(legend1)
-    ax[0].set_title('Clusterização com KMeans')
+    # Plotar Clusterização com KMeans
+    fig_kmeans = px.scatter(
+        cluster_df, 
+        x='PC1', 
+        y='PC2', 
+        color='Cluster KMeans',
+        title='Clusterização com KMeans',
+        labels={'Cluster KMeans': 'Clusters'},
+        template='plotly_white'
+    )
+    st.plotly_chart(fig_kmeans, use_container_width=True)
 
-    # Clusterização Hierárquica
-    scatter = ax[1].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_agglo, cmap='viridis')
-    legend2 = ax[1].legend(*scatter.legend_elements(), title="Clusters")
-    ax[1].add_artist(legend2)
-    ax[1].set_title('Clusterização Hierárquica')
-
-    st.pyplot(fig)
-    plt.close(fig)
+    # Plotar Clusterização com Agglomerative Clustering
+    fig_agglo = px.scatter(
+        cluster_df, 
+        x='PC1', 
+        y='PC2', 
+        color='Cluster Agglomerative',
+        title='Clusterização Hierárquica',
+        labels={'Cluster Agglomerative': 'Clusters'},
+        template='plotly_white'
+    )
+    st.plotly_chart(fig_agglo, use_container_width=True)
 
     # Métricas de Avaliação
     ari_kmeans = adjusted_rand_score(labels, clusters_kmeans)
@@ -706,140 +624,614 @@ def perform_clustering(model, dataloader, classes):
     st.write(f"**KMeans** - ARI: {ari_kmeans:.4f}, NMI: {nmi_kmeans:.4f}")
     st.write(f"**Agglomerative Clustering** - ARI: {ari_agglo:.4f}, NMI: {nmi_agglo:.4f}")
 
-def visualize_embeddings(df, class_names):
+def visualize_activations(model, image, classes, model_name, segmentation_model=None, segmentation=False):
     """
-    Reduz a dimensionalidade dos embeddings e os visualiza em 2D.
+    Visualiza as ativações do modelo utilizando Grad-CAM.
     """
-    embeddings = np.vstack(df['embedding'].values)
-    labels = df['label'].values
+    try:
+        # Inicializar o método Grad-CAM
+        from pytorch_grad_cam import GradCAM
+        from pytorch_grad_cam.utils.image import show_cam_on_image, preprocess_image
 
-    # PCA para redução de dimensionalidade
-    pca = PCA(n_components=2)
-    embeddings_2d = pca.fit_transform(embeddings)
+        target_layer = 'layer4' if model_name.startswith('ResNet') else 'features'
+        cam = GradCAM(model=model, target_layers=[getattr(model, target_layer)], use_cuda=torch.cuda.is_available())
 
-    # Criar DataFrame para visualização
-    plot_df = pd.DataFrame({
-        'PC1': embeddings_2d[:, 0],
-        'PC2': embeddings_2d[:, 1],
-        'label': labels
-    })
+        # Preparar a imagem
+        image_tensor = test_transforms(image).unsqueeze(0).to(device)
 
-    # Plotar os embeddings
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=plot_df, x='PC1', y='PC2', hue='label', palette='Set2', legend='full')
-    plt.title('Visualização de Embeddings com PCA')
-    plt.legend(title='Classes', labels=class_names)
-    plt.xlabel('Componente Principal 1')
-    plt.ylabel('Componente Principal 2')
-    st.pyplot(plt)
-    plt.close()
-def error_analysis(model, dataloader, classes):
-    """
-    Realiza análise de erros mostrando algumas imagens mal classificadas.
-    """
-    model.eval()
-    misclassified_images, misclassified_labels, misclassified_preds = [], [], []
-
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-
-            incorrect = preds != labels
-            if incorrect.any():
-                misclassified_images.extend(inputs[incorrect].cpu())
-                misclassified_labels.extend(labels[incorrect].cpu())
-                misclassified_preds.extend(preds[incorrect].cpu())
-
-                if len(misclassified_images) >= 5:  # Limitar a 5 imagens
-                    break
-
-    if misclassified_images:
-        st.write("Algumas imagens mal classificadas:")
-        fig, axes = plt.subplots(1, min(5, len(misclassified_images)), figsize=(15, 3))
-        for i in range(min(5, len(misclassified_images))):
-            image = misclassified_images[i].permute(1, 2, 0).numpy()
-            axes[i].imshow(image)
-            axes[i].set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
-            axes[i].axis('off')
-        st.pyplot(fig)
-        plt.close(fig)
-    else:
-        st.write("Nenhuma imagem mal classificada encontrada.")
-
-def visualize_activations(model, image, class_names, model_name, segmentation_model=None, segmentation=False):
-    """
-    Visualiza as ativações na imagem usando Grad-CAM e adiciona a segmentação de objetos.
-    """
-    model.eval()
-    input_tensor = test_transforms(image).unsqueeze(0).to(device)
-
-    # Determinar camada-alvo para Grad-CAM
-    if model_name.startswith('ResNet'):
-        target_layer = 'layer4'
-    elif model_name.startswith('DenseNet'):
-        target_layer = 'features.denseblock4'
-    else:
-        st.error("Modelo não suportado para Grad-CAM.")
-        return
-
-    # Grad-CAM
-    cam_extractor = SmoothGradCAMpp(model, target_layer=target_layer)
-    with torch.set_grad_enabled(True):
-        out = model(input_tensor)
-        probabilities = torch.nn.functional.softmax(out, dim=1)
-        confidence, pred = torch.max(probabilities, 1)
-        pred_class = pred.item()
-
-        activation_map = cam_extractor(pred_class, out)[0]
-
-    result = overlay_mask(to_pil_image(input_tensor.squeeze().cpu()), to_pil_image(activation_map.squeeze(), mode='F'), alpha=0.5)
-    image_np = np.array(image)
-
-    # Visualização com segmentação (opcional)
-    if segmentation and segmentation_model is not None:
-        segmentation_model.eval()
+        # Fazer a previsão
+        model.eval()
         with torch.no_grad():
-            segmentation_output = segmentation_model(input_tensor)['out']
-            segmentation_mask = torch.argmax(segmentation_output.squeeze(), dim=0).cpu().numpy()
+            outputs = model(image_tensor)
+            _, pred = torch.max(outputs, 1)
+            target_category = pred.item()
 
-        segmentation_colored = label_to_color_image(segmentation_mask).astype(np.uint8)
-        segmentation_colored = cv2.resize(segmentation_colored, (image.size[0], image.size[1]))
+        # Extrair o CAM
+        grayscale_cam = cam(input_tensor=image_tensor, target_category=target_category)
+        grayscale_cam = grayscale_cam[0, :]
+        cam_image = show_cam_on_image(np.array(image.convert('RGB'))/255.0, grayscale_cam, use_rgb=True)
 
-        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[2].imshow(image_np)
-        ax[2].imshow(segmentation_colored, alpha=0.6)
-        ax[2].set_title('Segmentação')
+        st.write("### Ativações do Modelo (Grad-CAM):")
+        st.image(cam_image, caption='Grad-CAM', use_container_width=True)
+
+        # Visualizar a segmentação, se disponível
+        if segmentation_model is not None and segmentation:
+            st.write("### Segmentação:")
+            # Implementar a visualização da segmentação conforme o modelo
+            # Esta é uma implementação placeholder
+            seg_mask = segmentation_model(image_tensor)
+            seg_mask = torch.argmax(seg_mask, dim=1).squeeze().cpu().numpy()
+            seg_image = Image.fromarray(seg_mask.astype(np.uint8) * 255)
+            st.image(seg_image, caption='Máscara de Segmentação', use_container_width=True)
+    except Exception as e:
+        st.error(f"Erro ao visualizar ativações: {e}")
+
+def train_segmentation_model(images_dir, masks_dir, num_classes):
+    """
+    Função placeholder para treinar um modelo de segmentação.
+    Implementação completa depende dos requisitos específicos e dos dados.
+    """
+    st.write("**Treinamento do modelo de segmentação não implementado.**")
+    # Aqui você deve implementar o treinamento do modelo de segmentação conforme necessário
+    return None
+
+# Função Principal
+
+def main():
+    # Definir o caminho do ícone
+    icon_path = "logo.png"  # Verifique se o arquivo logo.png está no diretório correto
+
+    # Verificar se o arquivo de ícone existe antes de configurá-lo
+    if os.path.exists(icon_path):
+        try:
+            st.set_page_config(page_title="Geomaker", page_icon=icon_path, layout="wide")
+            logging.info(f"Ícone {icon_path} carregado com sucesso.")
+        except Exception as e:
+            st.set_page_config(page_title="Geomaker", layout="wide")
+            logging.warning(f"Erro ao carregar o ícone {icon_path}: {e}")
     else:
-        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
+        # Se o ícone não for encontrado, carrega sem favicon
+        st.set_page_config(page_title="Geomaker", layout="wide")
+        logging.warning(f"Ícone {icon_path} não encontrado, carregando sem favicon.")
 
-    for axis in ax:
-        axis.axis('off')
+    # Layout da página
+    if os.path.exists('capa.png'):
+        try:
+            st.image(
+                'capa.png', 
+                width=100, 
+                caption='Laboratório de Educação e Inteligência Artificial - Geomaker. "A melhor forma de prever o futuro é inventá-lo." - Alan Kay', 
+                use_container_width=True
+            )
+        except UnidentifiedImageError:
+            st.warning("Imagem 'capa.png' não pôde ser carregada ou está corrompida.")
+    else:
+        st.warning("Imagem 'capa.png' não encontrada.")
 
-    st.pyplot(fig)
-    plt.close(fig)
+    # Carregar o logotipo na barra lateral
+    if os.path.exists("logo.png"):
+        try:
+            st.sidebar.image("logo.png", width=200)
+        except UnidentifiedImageError:
+            st.sidebar.text("Imagem do logotipo não pôde ser carregada ou está corrompida.")
+    else:
+        st.sidebar.text("Imagem do logotipo não encontrada.")
 
-def evaluate_image(model, image, classes):
-    """
-    Avalia uma única imagem e retorna a classe predita e a confiança.
-    """
-    model.eval()
-    image_tensor = test_transforms(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        output = model(image_tensor)
-        probabilities = torch.nn.functional.softmax(output, dim=1)
-        confidence, predicted = torch.max(probabilities, 1)
-        class_idx = predicted.item()
-        class_name = classes[class_idx]
-    return class_name, confidence.item()
+    st.title("Classificação e Segmentação de Imagens de Melanoma com Aprendizado Profundo e Quântico")
+    st.write("Este aplicativo permite treinar modelos de classificação de melanomas utilizando conjuntos de dados adequados, aplicar algoritmos de clustering para análise comparativa e realizar segmentação de objetos.")
+    st.write("As etapas são cuidadosamente documentadas para auxiliar na reprodução e análise científica.")
 
+    # Inicializar segmentation_model
+    segmentation_model = None
 
+    # Opções para o modelo de segmentação
+    st.subheader("Opções para o Modelo de Segmentação")
+    segmentation_option = st.selectbox(
+        "Deseja utilizar um modelo de segmentação?", 
+        ["Não", "Utilizar modelo pré-treinado", "Treinar novo modelo de segmentação"]
+    )
+    if segmentation_option == "Utilizar modelo pré-treinado":
+        num_classes_segmentation = st.number_input(
+            "Número de Classes para Segmentação (Modelo Pré-treinado):", 
+            min_value=1, 
+            step=1, 
+            value=21
+        )
+        # Implementar a função get_segmentation_model conforme necessário
+        segmentation_model = train_segmentation_model(None, None, num_classes_segmentation)
+        st.write("Modelo de segmentação pré-treinado carregado.")
+    elif segmentation_option == "Treinar novo modelo de segmentação":
+        st.write("Treinamento do modelo de segmentação com seu próprio conjunto de dados.")
+        num_classes_segmentation = st.number_input(
+            "Número de Classes para Segmentação:", 
+            min_value=1, 
+            step=1, 
+            value=2
+        )
+        # Upload do conjunto de dados de segmentação
+        segmentation_zip = st.file_uploader(
+            "Faça upload de um arquivo ZIP contendo as imagens e máscaras de segmentação", 
+            type=["zip"]
+        )
+        if segmentation_zip is not None:
+            temp_seg_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_seg_dir, "segmentation.zip")
+            with open(zip_path, "wb") as f:
+                f.write(segmentation_zip.read())
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_seg_dir)
+
+            # Espera-se que as imagens estejam em 'images/' e as máscaras em 'masks/' dentro do ZIP
+            images_dir = os.path.join(temp_seg_dir, 'images')
+            masks_dir = os.path.join(temp_seg_dir, 'masks')
+
+            if os.path.exists(images_dir) and os.path.exists(masks_dir):
+                # Treinar o modelo de segmentação
+                st.write("Iniciando o treinamento do modelo de segmentação...")
+                segmentation_model = train_segmentation_model(images_dir, masks_dir, num_classes_segmentation)
+                if segmentation_model is not None:
+                    st.success("Treinamento do modelo de segmentação concluído!")
+            else:
+                st.error("Estrutura de diretórios inválida no arquivo ZIP. Certifique-se de que as imagens estão em 'images/' e as máscaras em 'masks/'.")
+        else:
+            st.warning("Aguardando o upload do conjunto de dados de segmentação.")
+    else:
+        segmentation_model = None
+
+    # Barra Lateral de Configurações
+    st.sidebar.title("Configurações do Treinamento")
+
+    # Adicionar seleção de modo
+    mode = st.sidebar.selectbox(
+        "Modo de Treinamento:",
+        options=["Clássico (PyTorch)", "Quântico (TFQ)"],
+        index=0,
+        key="mode_selection"
+    )
+
+    if mode == "Clássico (PyTorch)":
+        num_classes = st.sidebar.number_input(
+            "Número de Classes:", 
+            min_value=2, 
+            step=1, 
+            key="num_classes"
+        )
+        model_name = st.sidebar.selectbox(
+            "Modelo Pré-treinado:", 
+            options=['ResNet18', 'ResNet50', 'DenseNet121'], 
+            key="model_name"
+        )
+        fine_tune = st.sidebar.checkbox(
+            "Fine-Tuning Completo", 
+            value=False, 
+            key="fine_tune"
+        )
+        epochs = st.sidebar.slider(
+            "Número de Épocas:", 
+            min_value=1, 
+            max_value=500, 
+            value=20, 
+            step=1, 
+            key="epochs"
+        )
+        learning_rate = st.sidebar.select_slider(
+            "Taxa de Aprendizagem:", 
+            options=[0.1, 0.01, 0.001, 0.0001], 
+            value=0.001, 
+            key="learning_rate"
+        )
+        batch_size = st.sidebar.selectbox(
+            "Tamanho de Lote:", 
+            options=[4, 8, 16, 32, 64], 
+            index=2, 
+            key="batch_size"
+        )
+        train_split = st.sidebar.slider(
+            "Percentual de Treinamento:", 
+            min_value=0.5, 
+            max_value=0.9, 
+            value=0.7, 
+            step=0.05, 
+            key="train_split"
+        )
+        valid_split = st.sidebar.slider(
+            "Percentual de Validação:", 
+            min_value=0.05, 
+            max_value=0.4, 
+            value=0.15, 
+            step=0.05, 
+            key="valid_split"
+        )
+        l2_lambda = st.sidebar.number_input(
+            "L2 Regularization (Weight Decay):", 
+            min_value=0.0, 
+            max_value=0.1, 
+            value=0.01, 
+            step=0.01, 
+            key="l2_lambda"
+        )
+        patience = st.sidebar.number_input(
+            "Paciência para Early Stopping:", 
+            min_value=1, 
+            max_value=10, 
+            value=3, 
+            step=1, 
+            key="patience"
+        )
+        use_weighted_loss = st.sidebar.checkbox(
+            "Usar Perda Ponderada para Classes Desbalanceadas", 
+            value=False, 
+            key="use_weighted_loss"
+        )
+    elif mode == "Quântico (TFQ)":
+        # Configurações para o modo quântico
+        epochs_q = st.sidebar.slider(
+            "Número de Épocas (Quântico):", 
+            min_value=1, 
+            max_value=20, 
+            value=3, 
+            step=1, 
+            key="epochs_q"
+        )
+        batch_size_q = st.sidebar.selectbox(
+            "Tamanho de Lote (Quântico):", 
+            options=[4, 8, 16, 32, 64], 
+            index=2, 
+            key="batch_size_q"
+        )
+        n_qubits = st.sidebar.number_input(
+            "Número de Qubits:", 
+            min_value=2, 
+            max_value=10, 
+            value=4, 
+            step=1, 
+            key="n_qubits"
+        )
+        n_layers = st.sidebar.number_input(
+            "Número de Camadas no Circuito Quântico:", 
+            min_value=1, 
+            max_value=10, 
+            value=2, 
+            step=1, 
+            key="n_layers"
+        )
+        learning_rate_q = st.sidebar.select_slider(
+            "Taxa de Aprendizagem (Quântico):", 
+            options=[0.1, 0.01, 0.001, 0.0001], 
+            value=0.01, 
+            key="learning_rate_q"
+        )
+        optimizer_type_q = st.sidebar.selectbox(
+            "Tipo de Otimizador (Quântico):", 
+            options=['Adam', 'SGD', 'RMSprop'], 
+            key="optimizer_type_q"
+        )
+        threshold_q = st.sidebar.slider(
+            "Threshold para Binarização [0,1] (Quântico):", 
+            0.0, 
+            1.0, 
+            0.5, 
+            step=0.05, 
+            key="threshold_q"
+        )
+        use_hardware = st.sidebar.checkbox(
+            "Usar Hardware Quântico Real (IBM Quantum)", 
+            value=False, 
+            key="use_hardware"
+        )
+        if use_hardware:
+            # Como Qiskit IBM Quantum foi removido, informamos que apenas simuladores são suportados
+            st.sidebar.error("Integração com hardware quântico real removida. Apenas simuladores estão disponíveis.")
+            backend_name = 'statevector_simulator'
+        else:
+            backend_name = 'statevector_simulator'
+            st.sidebar.info(f"Usando backend simulado: {backend_name}")
+
+        # Mensagem clara de modo experimental
+        st.sidebar.warning(
+            "⚠️ **Modo Quântico Experimental:** Atualmente, os modelos quânticos não superam os modelos clássicos (CNNs) para tarefas de classificação de imagens. Utilize este modo para fins educacionais e exploratórios."
+        )
+
+    # Opções de carregamento do modelo
+    st.header("Opções de Carregamento do Modelo")
+
+    model_option = st.selectbox(
+        "Escolha uma opção:", 
+        ["Treinar um novo modelo", "Carregar um modelo existente"], 
+        key="model_option_main"
+    )
+    if model_option == "Carregar um modelo existente":
+        if mode == "Clássico (PyTorch)":
+            # Upload do modelo pré-treinado
+            model_file = st.file_uploader(
+                "Faça upload do arquivo do modelo (.pt ou .pth)", 
+                type=["pt", "pth"], 
+                key="model_file_uploader_main"
+            )
+            if model_file is not None:
+                if num_classes > 0:
+                    # Carregar o modelo clássico
+                    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False, seed=42)
+                    if model is None:
+                        st.error("Erro ao carregar o modelo.")
+                        return
+
+                    # Carregar os pesos do modelo
+                    try:
+                        state_dict = torch.load(model_file, map_location=device)
+                        model.load_state_dict(state_dict)
+                        st.session_state['model'] = model
+                        st.session_state['trained_model_name'] = model_name  # Armazena o nome do modelo treinado
+                        st.success("Modelo clássico carregado com sucesso!")
+                    except Exception as e:
+                        st.error(f"Erro ao carregar o modelo: {e}")
+                        return
+
+                    # Carregar as classes
+                    classes_file = st.file_uploader(
+                        "Faça upload do arquivo com as classes (classes.txt)", 
+                        type=["txt"], 
+                        key="classes_file_uploader_main"
+                    )
+                    if classes_file is not None:
+                        classes = classes_file.read().decode("utf-8").splitlines()
+                        st.session_state['classes'] = classes
+                        st.write(f"Classes carregadas: {classes}")
+                    else:
+                        st.error("Por favor, forneça o arquivo com as classes.")
+                else:
+                    st.warning("Por favor, forneça o número de classes correto.")
+        elif mode == "Quântico (TFQ)":
+            # Upload do modelo quântico pré-treinado
+            q_model_file = st.file_uploader(
+                "Faça upload do arquivo do modelo quântico (.keras)", 
+                type=["keras", "h5"], 
+                key="q_model_file_uploader_main"
+            )
+            if q_model_file is not None:
+                try:
+                    quantum_model = tf.keras.models.load_model(q_model_file, compile=False, custom_objects={'PQC': tfq.layers.PQC})
+                    st.session_state['quantum_model'] = quantum_model
+                    st.success("Modelo quântico carregado com sucesso!")
+                except Exception as e:
+                    st.error(f"Erro ao carregar o modelo quântico: {e}")
+                    return
+
+                # Carregar as classes
+                classes_file_q = st.file_uploader(
+                    "Faça upload do arquivo com as classes (classes_quantic.txt)", 
+                    type=["txt"], 
+                    key="classes_file_uploader_quantic"
+                )
+                if classes_file_q is not None:
+                    classes_q = classes_file_q.read().decode("utf-8").splitlines()
+                    st.session_state['classes'] = classes_q
+                    st.write(f"Classes carregadas: {classes_q}")
+                else:
+                    st.error("Por favor, forneça o arquivo com as classes quânticas.")
+    elif model_option == "Treinar um novo modelo":
+        # Upload do arquivo ZIP
+        zip_file = st.file_uploader(
+            "Upload do arquivo ZIP com as imagens", 
+            type=["zip"], 
+            key="zip_file_uploader"
+        )
+        if zip_file is not None:
+            if mode == "Clássico (PyTorch)":
+                if num_classes > 0 and train_split + valid_split <= 0.95:
+                    temp_dir = tempfile.mkdtemp()
+                    zip_path = os.path.join(temp_dir, "uploaded.zip")
+                    with open(zip_path, "wb") as f:
+                        f.write(zip_file.read())
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # Verificar subdiretórios
+                    expected_dirs = ['images', 'masks']
+                    found_dirs = {}
+                    for root, dirs, files in os.walk(temp_dir):
+                        for d in dirs:
+                            if d.lower() in expected_dirs:
+                                found_dirs[d.lower()] = os.path.join(root, d)
+                    
+                    if 'images' in found_dirs and 'masks' in found_dirs:
+                        images_dir = found_dirs['images']
+                        masks_dir = found_dirs['masks']
+
+                        st.write("Iniciando o treinamento supervisionado...")
+                        model_data = train_model(
+                            data_dir=images_dir, 
+                            num_classes=num_classes, 
+                            model_name=model_name, 
+                            fine_tune=fine_tune, 
+                            epochs=epochs, 
+                            learning_rate=learning_rate, 
+                            batch_size=batch_size, 
+                            train_split=train_split, 
+                            valid_split=valid_split, 
+                            use_weighted_loss=use_weighted_loss, 
+                            l2_lambda=l2_lambda, 
+                            patience=patience, 
+                            seed=42,
+                            mode=mode
+                        )
+
+                        if model_data is None:
+                            st.error("Erro no treinamento do modelo.")
+                            shutil.rmtree(temp_dir)
+                            return
+
+                        model, classes = model_data
+                        # O modelo e as classes já estão armazenados no st.session_state
+                        st.success("Treinamento concluído!")
+
+                        # Opção para baixar o modelo treinado
+                        st.write("### Faça o Download do Modelo Treinado:")
+                        buffer = io.BytesIO()
+                        torch.save(model.state_dict(), buffer)
+                        buffer.seek(0)
+                        btn = st.download_button(
+                            label="Download do Modelo",
+                            data=buffer,
+                            file_name="modelo_treinado.pth",
+                            mime="application/octet-stream",
+                            key="download_model_button"
+                        )
+
+                        # Salvar as classes em um arquivo
+                        classes_data = "\n".join(classes)
+                        st.download_button(
+                            label="Download das Classes",
+                            data=classes_data,
+                            file_name="classes.txt",
+                            mime="text/plain",
+                            key="download_classes_button"
+                        )
+
+                        # Limpar o diretório temporário
+                        shutil.rmtree(temp_dir)
+                    else:
+                        st.error("Estrutura de diretórios inválida no arquivo ZIP. Certifique-se de que as imagens estão em 'images/' e as máscaras em 'masks/'.")
+            elif mode == "Quântico (TFQ)":
+                if n_qubits >= 2 and n_qubits <= 10:
+                    # Aqui você pode implementar o treinamento quântico com os dados fornecidos
+                    st.write("**Treinamento do modelo quântico ainda não implementado para upload de dados.**")
+                    # Placeholder para a funcionalidade de upload de dados quânticos
+                else:
+                    st.error("O número de qubits deve estar entre 2 e 10 para o treinamento quântico.")
+    
+    # Avaliação de uma imagem individual
+    st.header("Avaliação de Imagem")
+    evaluate = st.radio(
+        "Deseja avaliar uma imagem?", 
+        ("Sim", "Não"), 
+        key="evaluate_option"
+    )
+    if evaluate == "Sim":
+        eval_image_file = st.file_uploader(
+            "Faça upload da imagem para avaliação", 
+            type=["png", "jpg", "jpeg", "bmp", "gif"], 
+            key="eval_image_file"
+        )
+        if eval_image_file is not None:
+            eval_image_file.seek(0)
+            try:
+                eval_image = Image.open(eval_image_file).convert("RGB")
+            except Exception as e:
+                st.error(f"Erro ao abrir a imagem: {e}")
+                return
+
+            st.image(eval_image, caption='Imagem para avaliação', use_container_width=True)
+
+            if mode == "Clássico (PyTorch)":
+                # Verificar se o modelo já foi carregado ou treinado
+                if 'model' not in st.session_state or 'classes' not in st.session_state:
+                    st.warning("Nenhum modelo carregado ou treinado. Por favor, carregue um modelo existente ou treine um novo modelo.")
+                else:
+                    model_eval = st.session_state['model']
+                    classes_eval = st.session_state['classes']
+                    model_name_eval = st.session_state.get('trained_model_name', 'ResNet18')  # Usa o nome do modelo armazenado
+
+                    class_name, confidence = evaluate_image(model_eval, eval_image, classes_eval)
+                    st.write(f"**Classe Predita:** {class_name}")
+                    st.write(f"**Confiança:** {confidence:.4f}")
+
+                    # Opção para visualizar segmentação
+                    segmentation = False
+                    if segmentation_model is not None:
+                        segmentation = st.checkbox(
+                            "Visualizar Segmentação", 
+                            value=True, 
+                            key="segmentation_checkbox"
+                        )
+
+                    # Visualizar ativações e segmentação
+                    visualize_activations(
+                        model_eval, 
+                        eval_image, 
+                        classes_eval, 
+                        model_name_eval, 
+                        segmentation_model=segmentation_model, 
+                        segmentation=segmentation
+                    )
+            elif mode == "Quântico (TFQ)":
+                # Verificar se o modelo quântico está carregado ou treinado
+                if 'quantum_model' not in st.session_state or 'classes' not in st.session_state or 'pca' not in st.session_state or 'scaler' not in st.session_state:
+                    st.warning("Nenhum modelo quântico carregado ou treinado. Por favor, carregue um modelo quântico existente ou treine um novo modelo.")
+                else:
+                    quantum_model = st.session_state['quantum_model']
+                    quantum_circuit = st.session_state['quantum_circuit']
+                    quantum_symbols = st.session_state['quantum_symbols']
+                    pca = st.session_state['pca']
+                    scaler = st.session_state['scaler']
+                    classes_eval = st.session_state['classes']  # Para o modo quântico, classes devem ser definidas pelo usuário
+
+                    class_name, confidence_q = evaluate_image(model=None, image=eval_image, classes=classes_eval, pca=pca, scaler=scaler, quantum=True)
+                    st.write(f"**Classe Predita (Quântico):** {class_name}")
+                    st.write(f"**Confiança (Quântico):** {confidence_q:.4f}")
+
+                    # Visualizar ativações - Grad-CAM não está implementado para modelos quânticos
+                    st.write("**Visualização de Ativações:** Não disponível para o modo quântico.")
+
+    # Visualização de Circuitos Quânticos
+    st.header("Gerador e Visualizador de Circuitos Quânticos")
+    st.write("Selecione o tipo de circuito quântico que deseja gerar e visualize-o abaixo.")
+
+    # Seleção do tipo de circuito
+    circuit_type_display = st.selectbox(
+        "Selecione o Tipo de Circuito:",
+        options=["Basic", "Entangling", "Rotation"],
+        index=0,
+        key="circuit_type_display"
+    )
+
+    # Função para criar circuitos com base no tipo selecionado
+    def create_quantum_model_display(circuit_type):
+        """
+        Cria um circuito quântico com base no tipo selecionado.
+        """
+        if circuit_type == "Basic":
+            n_qubits = 2
+            n_layers = 1
+        elif circuit_type == "Entangling":
+            n_qubits = 4
+            n_layers = 2
+        elif circuit_type == "Rotation":
+            n_qubits = 2
+            n_layers = 3
+        else:
+            st.error("Tipo de circuito não suportado.")
+            return None, None
+
+        circuit, symbols = create_quantum_circuit(n_qubits, n_layers)
+        return circuit, symbols
+
+    # Botão para gerar o circuito
+    if st.button("Gerar Circuito Quântico"):
+        with st.spinner("Gerando o circuito quântico..."):
+            quantum_circuit_display, quantum_symbols_display = create_quantum_model_display(circuit_type_display)
+        
+        if quantum_circuit_display is not None:
+            st.write(f"### Circuito Selecionado: **{circuit_type_display}**")
+            st.write(quantum_circuit_display)
+        else:
+            st.error("Falha ao gerar o circuito quântico.")
+
+    # Opcional: Mostrar o código do circuito
+    if st.checkbox("Mostrar Código do Circuito Quântico"):
+        quantum_circuit_display, quantum_symbols_display = create_quantum_model_display(circuit_type_display)
+        if quantum_circuit_display is not None:
+            st.code(str(quantum_circuit_display), language='python')
+        else:
+            st.error("Nenhum código para exibir.")
+
+    # Documentação dos Procedimentos
+    st.write("### Documentação dos Procedimentos")
+    st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
+
+    # Encerrar a aplicação
+    st.write("Obrigado por utilizar o aplicativo!")
+
+# Executar a aplicação
+if __name__ == "__main__":
+    main()
