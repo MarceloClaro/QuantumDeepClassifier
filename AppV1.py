@@ -1094,16 +1094,44 @@ def train_quantum_model(
     set_seed(seed)
 
     # 1) Carregar o dataset ISIC
-    # Aqui assumimos que as imagens já estão redimensionadas e binarizadas se necessário
-    # A função de pré-processamento foi adaptada para o ISIC
-    # A função 'load_isic_dataset' deve ser chamada antes para obter os DataLoaders
-
-    # Nota: Este exemplo utiliza um conjunto de dados simplificado.
-    # Para um caso real, ajuste conforme a estrutura e os requisitos do seu conjunto de dados ISIC.
+    # Aqui, adaptamos para usar um conjunto de dados adequado para melanomas (ISIC)
+    # Por simplicidade, este exemplo utiliza uma abordagem simplificada
 
     st.write("**Treinamento Quântico não implementado completamente para o conjunto de dados ISIC.**")
     st.write("Implementação completa requer adaptação específica para os dados e arquitetura quântica desejada.")
     return None, None, None, None
+
+def create_quantum_model(circuit_type):
+    """
+    Cria e retorna um circuito quântico baseado no tipo selecionado.
+
+    Args:
+        circuit_type (str): Tipo de circuito a ser criado ('Basic', 'Entangling', 'Rotation').
+
+    Returns:
+        tuple: (circuit, readout) onde 'circuit' é o circuito Cirq criado e 'readout' são os operadores de leitura.
+    """
+    qubits = cirq.GridQubit.rect(2, 2)  # Exemplo com 4 qubits (2x2)
+    circuit = cirq.Circuit()
+
+    if circuit_type == 'Basic':
+        # Aplicar portas H em todos os qubits
+        circuit.append([cirq.H(q) for q in qubits])
+    elif circuit_type == 'Entangling':
+        # Aplicar portas CNOT entre qubits adjacentes para criar entrelaçamento
+        circuit.append([cirq.CNOT(qubits[i], qubits[i+1]) for i in range(len(qubits)-1)])
+    elif circuit_type == 'Rotation':
+        # Aplicar portas de rotação Rx em todos os qubits
+        circuit.append([cirq.rx(np.pi/4)(q) for q in qubits])
+    else:
+        st.error("Tipo de circuito não reconhecido.")
+        return None, None
+
+    # Adicionar operações de medição
+    readout = cirq.measure(*qubits, key='result')
+    circuit.append(readout)
+
+    return circuit, readout
 
 def main():
     # Definir o caminho do ícone
@@ -1450,19 +1478,11 @@ def main():
                     classes_eval = st.session_state['classes']  # Para o modo quântico, classes devem ser definidas pelo usuário
 
                     # Preparar a imagem para o modelo quântico
-                    # Reduzir para 4x4 e binarizar
-                    image_tensor = tf.image.resize(np.array(eval_image), (4,4))[..., np.newaxis] / 255.0
+                    # Reduzir para 2x2 e binarizar (ajustado para 2x2 qubits)
+                    image_tensor = tf.image.resize(np.array(eval_image), (2,2))[..., np.newaxis] / 255.0
                     image_bin = (image_tensor > threshold_q).numpy().astype(np.float32).flatten()
 
                     # Converter para circuito
-                    def convert_to_circuit_q(image_bin):
-                        qubits = cirq.GridQubit.rect(4,4)
-                        circuit = cirq.Circuit()
-                        for i, v in enumerate(image_bin):
-                            if v:
-                                circuit.append(cirq.X(qubits[i]))
-                        return circuit
-
                     circuit = convert_to_circuit_q(image_bin)
                     x_eval_circ = tfq.convert_to_tensor([circuit])
 
@@ -1479,43 +1499,22 @@ def main():
                     # Visualizar ativações - Grad-CAM não está implementado para modelos quânticos
                     st.write("**Visualização de Ativações:** Não disponível para o modo quântico.")
 
-    # Visualização de Circuitos Quânticos
-    st.header("Gerador e Visualizador de Circuitos Quânticos")
-    st.write("Selecione o tipo de circuito quântico que deseja gerar e visualize-o abaixo.")
+def convert_to_circuit_q(image_bin):
+    """
+    Converte uma imagem binarizada em um circuito quântico Cirq.
+    
+    Args:
+        image_bin (np.ndarray): Array binarizado representando a imagem.
 
-    # Seleção do tipo de circuito
-    circuit_type_display = st.selectbox(
-        "Selecione o Tipo de Circuito:",
-        options=["Basic", "Entangling", "Rotation"],
-        index=0,
-        key="circuit_type_display"
-    )
-
-    # Botão para gerar o circuito
-    if st.button("Gerar Circuito Quântico"):
-        with st.spinner("Gerando o circuito quântico..."):
-            circuit_display, readout_display = create_quantum_model(circuit_type_display)
-        
-        if circuit_display is not None:
-            st.write(f"### Circuito Selecionado: **{circuit_type_display}**")
-            visualize_circuit(circuit_display)
-        else:
-            st.error("Falha ao gerar o circuito quântico.")
-
-    # Opcional: Mostrar o código do circuito
-    if st.checkbox("Mostrar Código do Circuito Quântico"):
-        circuit_display, readout_display = create_quantum_model(circuit_type_display)
-        if circuit_display is not None:
-            st.code(str(circuit_display), language='python')
-        else:
-            st.error("Nenhum código para exibir.")
-
-    # Documentação dos Procedimentos
-    st.write("### Documentação dos Procedimentos")
-    st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
-
-    # Encerrar a aplicação
-    st.write("Obrigado por utilizar o aplicativo!")
+    Returns:
+        cirq.Circuit: Circuito quântico criado a partir da imagem.
+    """
+    qubits = cirq.GridQubit.rect(2, 2)  # Ajustado para 2x2 qubits
+    circuit = cirq.Circuit()
+    for i, v in enumerate(image_bin):
+        if v:
+            circuit.append(cirq.X(qubits[i]))
+    return circuit
 
 def train_segmentation_model(images_dir, masks_dir, num_classes, seed=42):
     """
@@ -1668,31 +1667,37 @@ def perform_clustering(model, dataloader, classes):
     st.write(f"**KMeans** - ARI: {ari_kmeans:.4f}, NMI: {nmi_kmeans:.4f}")
     st.write(f"**Agglomerative Clustering** - ARI: {ari_agglo:.4f}, NMI: {nmi_agglo:.4f}")
 
-def train_quantum_model(
-    epochs=3, 
-    batch_size=32, 
-    threshold=0.5,
-    circuit_type='Basic',
-    optimizer_type='Adam',
-    use_hardware=False,
-    backend_name='statevector_simulator',
-    seed=42
-):
+def create_quantum_model(circuit_type):
     """
-    Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
-    Possibilita a integração com hardware quântico real via Qiskit (opcional).
-    
-    Retorna o modelo Keras treinado, histórico, resultados e backend utilizado.
+    Cria e retorna um circuito quântico baseado no tipo selecionado.
+
+    Args:
+        circuit_type (str): Tipo de circuito a ser criado ('Basic', 'Entangling', 'Rotation').
+
+    Returns:
+        tuple: (circuit, readout) onde 'circuit' é o circuito Cirq criado e 'readout' são os operadores de leitura.
     """
-    set_seed(seed)
+    qubits = cirq.GridQubit.rect(2, 2)  # Exemplo com 4 qubits (2x2)
+    circuit = cirq.Circuit()
 
-    # 1) Carregar MNIST e filtrar dígitos 3 e 6
-    # Aqui, adaptamos para usar um conjunto de dados adequado para melanomas (ISIC)
-    # Por simplicidade, este exemplo utiliza uma abordagem simplificada
+    if circuit_type == 'Basic':
+        # Aplicar portas H em todos os qubits
+        circuit.append([cirq.H(q) for q in qubits])
+    elif circuit_type == 'Entangling':
+        # Aplicar portas CNOT entre qubits adjacentes para criar entrelaçamento
+        circuit.append([cirq.CNOT(qubits[i], qubits[i+1]) for i in range(len(qubits)-1)])
+    elif circuit_type == 'Rotation':
+        # Aplicar portas de rotação Rx em todos os qubits
+        circuit.append([cirq.rx(np.pi/4)(q) for q in qubits])
+    else:
+        st.error("Tipo de circuito não reconhecido.")
+        return None, None
 
-    st.write("**Treinamento Quântico não implementado completamente para o conjunto de dados ISIC.**")
-    st.write("Implementação completa requer adaptação específica para os dados e arquitetura quântica desejada.")
-    return None, None, None, None
+    # Adicionar operações de medição
+    readout = cirq.measure(*qubits, key='result')
+    circuit.append(readout)
+
+    return circuit, readout
 
 def main():
     # Definir o caminho do ícone
@@ -2039,19 +2044,11 @@ def main():
                     classes_eval = st.session_state['classes']  # Para o modo quântico, classes devem ser definidas pelo usuário
 
                     # Preparar a imagem para o modelo quântico
-                    # Reduzir para 4x4 e binarizar
-                    image_tensor = tf.image.resize(np.array(eval_image), (4,4))[..., np.newaxis] / 255.0
+                    # Reduzir para 2x2 e binarizar (ajustado para 2x2 qubits)
+                    image_tensor = tf.image.resize(np.array(eval_image), (2,2))[..., np.newaxis] / 255.0
                     image_bin = (image_tensor > threshold_q).numpy().astype(np.float32).flatten()
 
                     # Converter para circuito
-                    def convert_to_circuit_q(image_bin):
-                        qubits = cirq.GridQubit.rect(4,4)
-                        circuit = cirq.Circuit()
-                        for i, v in enumerate(image_bin):
-                            if v:
-                                circuit.append(cirq.X(qubits[i]))
-                        return circuit
-
                     circuit = convert_to_circuit_q(image_bin)
                     x_eval_circ = tfq.convert_to_tensor([circuit])
 
@@ -2105,87 +2102,6 @@ def main():
 
     # Encerrar a aplicação
     st.write("Obrigado por utilizar o aplicativo!")
-
-def train_segmentation_model(images_dir, masks_dir, num_classes, seed=42):
-    """
-    Treina o modelo de segmentação com o conjunto de dados fornecido pelo usuário.
-    """
-    set_seed(seed)
-    batch_size = 4
-    num_epochs = 25
-    learning_rate = 0.001
-
-    # Transformações
-    input_transforms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
-    target_transforms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
-
-    # Dataset
-    dataset = SegmentationDataset(images_dir, masks_dir, transform=input_transforms, target_transform=target_transforms)
-
-    # Dividir em treino e validação
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    if train_size == 0 or val_size == 0:
-        st.error("Conjunto de dados de segmentação muito pequeno para dividir em treino e validação.")
-        return None
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-    # Dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, worker_init_fn=seed_worker)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
-
-    # Modelo
-    model = get_segmentation_model(num_classes=num_classes, fine_tune=True, seed=seed)
-
-    # Otimizador e função de perda
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-    # Treinamento
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-
-        for inputs, masks in train_loader:
-            inputs = inputs.to(device)
-            masks = masks.to(device).long().squeeze(1)  # Ajustar dimensões
-
-            optimizer.zero_grad()
-            outputs = model(inputs)['out']
-            loss = criterion(outputs, masks)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * inputs.size(0)
-
-        epoch_loss = running_loss / len(train_loader.dataset)
-        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Treino: {epoch_loss:.4f}')
-
-        # Validação
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, masks in val_loader:
-                inputs = inputs.to(device)
-                masks = masks.to(device).long().squeeze(1)
-
-                outputs = model(inputs)['out']
-                loss = criterion(outputs, masks)
-                val_loss += loss.item() * inputs.size(0)
-
-        val_loss = val_loss / len(val_loader.dataset)
-        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Validação: {val_loss:.4f}')
-
-    return model
-
-# Função auxiliar para criar subplots do Plotly
-from plotly.subplots import make_subplots
 
 # Executar a aplicação
 if __name__ == "__main__":
