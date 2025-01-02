@@ -1,4 +1,4 @@
-import os 
+import os
 import zipfile
 import shutil
 import tempfile
@@ -38,9 +38,6 @@ import tensorflow as tf
 import tensorflow_quantum as tfq
 import cirq
 import sympy
-# Removidas as importações do Qiskit IBM Quantum
-# from qiskit import IBMQ, Aer, transpile
-# from qiskit.providers.ibmq import least_busy
 
 # Supressão dos avisos relacionados ao torch.classes
 warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.classes.*")
@@ -979,7 +976,7 @@ def train_quantum_model(
     """
     Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
     Possibilita a integração com hardware quântico real via Qiskit (opcional).
-    
+
     Retorna o modelo Keras treinado, histórico, resultados e backend utilizado.
     """
     # 1) Carregar MNIST e filtrar dígitos 3 e 6
