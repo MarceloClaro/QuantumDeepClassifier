@@ -24,7 +24,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve
 )
-from sklearn.preprocessing import label_binarize
+from sklearn.preprocessing import label_binarize, MinMaxScaler
 from sklearn.decomposition import PCA
 import streamlit as st
 import gc
@@ -45,6 +45,9 @@ import tensorflow as tf
 import tensorflow_quantum as tfq
 import cirq
 import sympy
+import json
+from tensorflow.keras.layers import Layer
+from cirq.contrib.svg import circuit_to_svg  # Já deve estar disponível após a instalação com extras SVG
 
 # Supressão dos avisos relacionados ao torch.classes
 warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.classes.*")
@@ -144,6 +147,34 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+# Definição da camada personalizada SerializablePQC
+class SerializablePQC(Layer):
+    def __init__(self, circuit, observables, **kwargs):
+        super().__init__(**kwargs)
+        self.circuit = circuit
+        self.observables = observables
+        self.pqc = tfq.layers.PQC(circuit, observables)
+    
+    def call(self, inputs):
+        return self.pqc(inputs)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'circuit': cirq.to_json(self.circuit),  # Serializa o circuito para JSON
+            'observables': [cirq.to_json(obs) for obs in self.observables],  # Serializa os observáveis
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        circuit_json = config.pop('circuit')
+        observables_json = config.pop('observables')
+        # Desserializa o circuito e os observáveis a partir do JSON
+        circuit = cirq.read_json(circuit_json)
+        observables = [cirq.read_json(obs_json) for obs_json in observables_json]
+        return cls(circuit, observables, **config)
 
 def visualize_data(dataset, classes):
     """
@@ -268,14 +299,13 @@ def create_quantum_circuit(n_qubits, n_layers):
 
 def build_quantum_model(n_qubits, n_layers, symbols, observables):
     """
-    Constrói um modelo quântico utilizando TFQ.
+    Constrói um modelo quântico utilizando TFQ com uma camada PQC serializável.
     """
     circuit, _ = create_quantum_circuit(n_qubits, n_layers)
-    readout = observables  # Lista de observáveis a serem medidos
-
+    
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(), dtype=tf.string),
-        tfq.layers.PQC(circuit, readout),
+        SerializablePQC(circuit, observables),  # Utiliza a camada personalizada
         tf.keras.layers.Dense(1, activation='sigmoid')  # Saída binária
     ])
     
@@ -351,15 +381,10 @@ def visualize_circuit(circuit):
     
     # Gerar SVG do circuito
     try:
-        from cirq.contrib.svg import circuit_to_svg
         svg = circuit_to_svg(circuit)
     except ImportError:
-        try:
-            from cirq.contrib.svg import SVGCircuit
-            svg = SVGCircuit(circuit).to_svg()
-        except ImportError as e:
-            st.error("Falha ao importar cirq.contrib.svg. Verifique a instalação do Cirq com suporte SVG.")
-            return
+        st.error("Falha ao importar cirq.contrib.svg. Verifique a instalação do Cirq com suporte SVG.")
+        return
     except Exception as e:
         st.error(f"Erro ao gerar SVG do circuito: {e}")
         return
@@ -1043,6 +1068,53 @@ def train_segmentation_model(images_dir, masks_dir, num_classes):
     # Aqui você deve implementar o treinamento do modelo de segmentação conforme necessário
     return None
 
+def visualize_activations(model, image, classes, model_name, segmentation_model=None, segmentation=False):
+    """
+    Visualiza as ativações do modelo utilizando Grad-CAM.
+    """
+    try:
+        # Inicializar o método Grad-CAM
+        cam_extractor = SmoothGradCAMpp(model, target_layer='fc')  # Ajuste 'fc' conforme o modelo
+    
+        # Preparar a imagem
+        image_tensor = test_transforms(image).unsqueeze(0).to(device)
+    
+        # Fazer a previsão
+        model.eval()
+        with torch.no_grad():
+            output = model(image_tensor)
+            _, pred = torch.max(output, 1)
+            class_idx = pred.item()
+    
+        # Extrair o CAM
+        activation_map = cam_extractor(class_idx, output)
+        activation_map = activation_map.squeeze().cpu().numpy()
+    
+        # Overlay do CAM na imagem original
+        cam_image = overlay_mask(
+            to_pil_image(image_tensor.squeeze().cpu()),
+            Image.fromarray((activation_map * 255).astype(np.uint8)),
+            alpha=0.5
+        )
+    
+        st.write("### Ativações do Modelo (Grad-CAM):")
+        st.image(cam_image, caption='Grad-CAM', use_container_width=True)
+    
+        # Visualizar a segmentação, se disponível
+        if segmentation_model is not None and segmentation:
+            st.write("### Segmentação:")
+            # Implementar a visualização da segmentação conforme o modelo
+            # Esta é uma implementação placeholder
+            seg_mask = segmentation_model(image_tensor)
+            seg_mask = torch.argmax(seg_mask, dim=1).squeeze().cpu().numpy()
+            seg_image = Image.fromarray(seg_mask.astype(np.uint8) * 255)
+            st.image(seg_image, caption='Máscara de Segmentação', use_container_width=True)
+    except Exception as e:
+        st.error(f"Erro ao visualizar ativações: {e}")
+
+# Funções adicionais como apply_transforms_and_get_embeddings, display_all_augmented_images, visualize_embeddings devem ser implementadas
+# Certifique-se de que todas as funções chamadas no código estão definidas
+
 def main():
     # Definir o caminho do ícone
     icon_path = "logo.png"  # Verifique se o arquivo logo.png está no diretório correto
@@ -1338,7 +1410,7 @@ def main():
             )
             if q_model_file is not None:
                 try:
-                    q_model = tf.keras.models.load_model(q_model_file, compile=False)
+                    q_model = tf.keras.models.load_model(q_model_file, compile=False, custom_objects={'SerializablePQC': SerializablePQC})
                     st.session_state['q_model'] = q_model
                     st.success("Modelo quântico carregado com sucesso!")
                 except Exception as e:
@@ -1447,8 +1519,11 @@ def main():
                         visualize_circuit(quantum_circuit)
 
                         # Salvar o modelo quântico
-                        quantum_model.save("quantum_model.h5")
-                        st.write("### Modelo Quântico Salvo como `quantum_model.h5`.")
+                        try:
+                            quantum_model.save("quantum_model.h5", save_format='h5')
+                            st.write("### Modelo Quântico Salvo como `quantum_model.h5`.")
+                        except Exception as e:
+                            st.error(f"Erro ao salvar o modelo quântico: {e}")
 
                         # Salvar as classes em um arquivo
                         # Como o treinamento quântico foi feito com ISIC, classes são definidas pelo usuário
@@ -1530,7 +1605,7 @@ def main():
 
                     # Preparar a imagem para o modelo quântico
                     # Reduzir para 2x2 e binarizar (ajustado para 2x2 qubits)
-                    image_resized = image.resize((2, 2))
+                    image_resized = eval_image.resize((2, 2))
                     image_tensor = np.array(image_resized) / 255.0
                     image_bin = (image_tensor > threshold_q).astype(float).flatten()
 
@@ -1620,6 +1695,127 @@ def main():
 
     # Encerrar a aplicação
     st.write("Obrigado por utilizar o aplicativo!")
+
+# Funções adicionais necessárias
+
+def apply_transforms_and_get_embeddings(dataset_subset, model_for_embeddings, transform, batch_size, seed):
+    """
+    Aplica transformações ao dataset e extrai embeddings utilizando o modelo clássico.
+    Retorna um DataFrame com embeddings, rótulos e imagens augmentadas.
+    """
+    dataloader = DataLoader(
+        dataset_subset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        worker_init_fn=seed_worker, 
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    embeddings = []
+    labels = []
+    augmented_images = []
+    
+    model_for_embeddings.eval()
+    model_for_embeddings.to(device)
+    
+    with torch.no_grad():
+        for inputs, lbls in dataloader:
+            inputs = inputs.to(device)
+            outputs = model_for_embeddings(inputs)
+            embeddings.append(outputs.cpu().numpy())
+            labels.extend(lbls.numpy())
+            augmented_images.extend(inputs.cpu())
+    
+    embeddings = np.vstack(embeddings)
+    df = pd.DataFrame(embeddings, columns=[f'feat_{i}' for i in range(embeddings.shape[1])])
+    df['label'] = labels
+    df['augmented_image'] = augmented_images
+    return df
+
+def display_all_augmented_images(df, classes, max_images=100):
+    """
+    Exibe todas as imagens augmentadas em um grid.
+    """
+    st.write(f"### Exibição de Até {max_images} Imagens Augmentadas")
+    images = df['augmented_image'].tolist()[:max_images]
+    num_cols = 5
+    num_rows = int(np.ceil(len(images) / num_cols))
+    fig = plt.figure(figsize=(15, 3 * num_rows))
+    for i, img_tensor in enumerate(images):
+        if i >= max_images:
+            break
+        image = img_tensor.permute(1, 2, 0).numpy()
+        ax = fig.add_subplot(num_rows, num_cols, i+1)
+        ax.imshow(image)
+        ax.axis('off')
+    st.pyplot(fig)
+    plt.close(fig)
+
+def visualize_embeddings(df, classes):
+    """
+    Visualiza os embeddings usando PCA.
+    """
+    st.write("### Visualização dos Embeddings com PCA")
+    pca = PCA(n_components=2)
+    embeddings_2d = pca.fit_transform(df.drop(columns=['label', 'augmented_image']))
+    df_plot = pd.DataFrame({
+        'PC1': embeddings_2d[:, 0],
+        'PC2': embeddings_2d[:, 1],
+        'Classe': [classes[label] for label in df['label']]
+    })
+    fig = px.scatter(
+        df_plot, 
+        x='PC1', 
+        y='PC2', 
+        color='Classe',
+        title='Embeddings Visualizados com PCA',
+        template='plotly_white'
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+def visualize_activations(model, image, classes, model_name, segmentation_model=None, segmentation=False):
+    """
+    Visualiza as ativações do modelo utilizando Grad-CAM.
+    """
+    try:
+        # Inicializar o método Grad-CAM
+        cam_extractor = SmoothGradCAMpp(model, target_layer='fc')  # Ajuste 'fc' conforme o modelo
+
+        # Preparar a imagem
+        image_tensor = test_transforms(image).unsqueeze(0).to(device)
+
+        # Fazer a previsão
+        model.eval()
+        with torch.no_grad():
+            output = model(image_tensor)
+            _, pred = torch.max(output, 1)
+            class_idx = pred.item()
+
+        # Extrair o CAM
+        activation_map = cam_extractor(class_idx, output)
+        activation_map = activation_map.squeeze().cpu().numpy()
+
+        # Overlay do CAM na imagem original
+        cam_image = overlay_mask(
+            to_pil_image(image_tensor.squeeze().cpu()),
+            Image.fromarray((activation_map * 255).astype(np.uint8)),
+            alpha=0.5
+        )
+
+        st.write("### Ativações do Modelo (Grad-CAM):")
+        st.image(cam_image, caption='Grad-CAM', use_container_width=True)
+
+        # Visualizar a segmentação, se disponível
+        if segmentation_model is not None and segmentation:
+            st.write("### Segmentação:")
+            # Implementar a visualização da segmentação conforme o modelo
+            # Esta é uma implementação placeholder
+            seg_mask = segmentation_model(image_tensor)
+            seg_mask = torch.argmax(seg_mask, dim=1).squeeze().cpu().numpy()
+            seg_image = Image.fromarray(seg_mask.astype(np.uint8) * 255)
+            st.image(seg_image, caption='Máscara de Segmentação', use_container_width=True)
+    except Exception as e:
+        st.error(f"Erro ao visualizar ativações: {e}")
 
 # Executar a aplicação
 if __name__ == "__main__":
