@@ -1,4 +1,4 @@
-import os 
+import os
 import zipfile
 import shutil
 import tempfile
@@ -32,18 +32,6 @@ import cv2
 import io
 import warnings
 from datetime import datetime  # Importação para data e hora
-
-# Importações adicionais para o modo quântico
-import tensorflow as tf
-import tensorflow_quantum as tfq
-import cirq
-import sympy
-from qiskit import IBMQ, Aer, transpile
-from qiskit.providers.ibmq import least_busy
-
-
-print("Todas as bibliotecas foram importadas com sucesso!")
-
 
 # Supressão dos avisos relacionados ao torch.classes
 warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.classes.*")
@@ -970,172 +958,83 @@ def visualize_activations(model, image, class_names, model_name, segmentation_mo
         st.pyplot(fig)
         plt.close(fig)  # Fechar a figura para liberar memória
 
-def train_quantum_model(
-    epochs=3, 
-    batch_size=32, 
-    threshold=0.5,
-    circuit_type='Basic',
-    optimizer_type='Adam',
-    use_hardware=False,
-    backend_name='statevector_simulator'
-):
+def train_segmentation_model(images_dir, masks_dir, num_classes):
     """
-    Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
-    Possibilita a integração com hardware quântico real via Qiskit (opcional).
-    
-    Retorna o modelo Keras treinado e alguns históricos.
+    Treina o modelo de segmentação com o conjunto de dados fornecido pelo usuário.
     """
-    # 1) Carregar MNIST e filtrar dígitos 3 e 6
-    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
-    x_train, x_test = x_train / 255.0, x_test / 255.0
+    set_seed(42)
+    batch_size = 4
+    num_epochs = 25
+    learning_rate = 0.001
 
-    def filter_36(x, y):
-        keep = (y == 3) | (y == 6)
-        x, y = x[keep], y[keep]
-        y = (y == 3)
-        return x, y
-
-    x_train, y_train = filter_36(x_train, y_train)
-    x_test, y_test = filter_36(x_test, y_test)
-
-    # Reduz a imagem para 4×4
-    x_train_small = tf.image.resize(x_train[..., np.newaxis], (4,4)).numpy()
-    x_test_small  = tf.image.resize(x_test[..., np.newaxis], (4,4)).numpy()
-
-    # Binariza
-    x_train_bin = np.array(x_train_small > threshold, dtype=np.float32)
-    x_test_bin  = np.array(x_test_small  > threshold, dtype=np.float32)
-
-    # 2) Converte cada imagem em um circuito Cirq
-    def convert_to_circuit(image):
-        values = image.flatten()
-        qubits = cirq.GridQubit.rect(4,4)
-        circuit = cirq.Circuit()
-        for i, v in enumerate(values):
-            if v:  # se for 1, aplica X
-                circuit.append(cirq.X(qubits[i]))
-        return circuit
-
-    x_train_circ = [convert_to_circuit(img) for img in x_train_bin]
-    x_test_circ  = [convert_to_circuit(img) for img in x_test_bin]
-
-    # Converte para tensores
-    x_train_tfcirc = tfq.convert_to_tensor(x_train_circ)
-    x_test_tfcirc  = tfq.convert_to_tensor(x_test_circ)
-
-    # 3) Define o circuito parametrizado baseado no tipo selecionado
-    def create_quantum_model(circuit_type='Basic'):
-        data_qubits = cirq.GridQubit.rect(4,4)
-        readout = cirq.GridQubit(-1, -1)
-
-        circuit = cirq.Circuit()
-        # Prepara qubit de leitura
-        circuit.append([cirq.X(readout), cirq.H(readout)])
-
-        if circuit_type == 'Basic':
-            # Exemplo de duas camadas com gates XX e ZZ
-            def add_layer(circuit, gate, prefix):
-                for i, qubit in enumerate(data_qubits):
-                    sym = sympy.Symbol(prefix + f'-{i}')
-                    circuit.append(gate(qubit, readout) ** sym)
-
-            add_layer(circuit, cirq.XX, "xx1")
-            add_layer(circuit, cirq.ZZ, "zz1")
-        elif circuit_type == 'Entangling':
-            # Circuito com gates de entanglement
-            def add_entangling_layer(circuit, gate, prefix):
-                for i in range(len(data_qubits)-1):
-                    sym = sympy.Symbol(prefix + f'-{i}')
-                    circuit.append(gate(data_qubits[i], data_qubits[i+1]) ** sym)
-
-            add_entangling_layer(circuit, cirq.CNOT, "cnot1")
-            add_entangling_layer(circuit, cirq.CZ, "cz1")
-        elif circuit_type == 'Rotation':
-            # Circuito com rotações parametrizadas
-            def add_rotation_layer(circuit, gate, prefix):
-                for i, qubit in enumerate(data_qubits):
-                    sym = sympy.Symbol(prefix + f'-{i}')
-                    circuit.append(gate(qubit) ** sym)
-
-            add_rotation_layer(circuit, cirq.ry, "ry1")
-            add_rotation_layer(circuit, cirq.rx, "rx1")
-        else:
-            st.error("Tipo de circuito não suportado.")
-            return None, None
-
-        # Finaliza com H no readout
-        circuit.append(cirq.H(readout))
-        return circuit, cirq.Z(readout)
-
-    q_circuit, q_readout = create_quantum_model(circuit_type=circuit_type)
-    if q_circuit is None:
-        return None, None, None
-
-    # 4) Define o otimizador baseado no tipo selecionado
-    if optimizer_type == 'Adam':
-        optimizer = tf.keras.optimizers.Adam()
-    elif optimizer_type == 'SGD':
-        optimizer = tf.keras.optimizers.SGD()
-    elif optimizer_type == 'RMSprop':
-        optimizer = tf.keras.optimizers.RMSprop()
-    else:
-        st.error("Tipo de otimizador não suportado.")
-        return None, None, None
-
-    # 5) Configura a camada PQC e o modelo Keras
-    model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(), dtype=tf.string),
-        tfq.layers.PQC(q_circuit, q_readout)
+    # Transformações
+    input_transforms = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+    ])
+    target_transforms = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
     ])
 
-    # 6) Configura loss e métricas
-    y_train_hinge = 2.0*y_train - 1.0
-    y_test_hinge  = 2.0*y_test  - 1.0
+    # Dataset
+    dataset = SegmentationDataset(images_dir, masks_dir, transform=input_transforms, target_transform=target_transforms)
 
-    def hinge_accuracy(y_true, y_pred):
-        y_t = tf.squeeze(y_true) > 0
-        y_p = tf.squeeze(y_pred) > 0
-        return tf.reduce_mean(tf.cast(y_t == y_p, tf.float32))
+    # Dividir em treino e validação
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    if train_size == 0 or val_size == 0:
+        st.error("Conjunto de dados de segmentação muito pequeno para dividir em treino e validação.")
+        return None
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-    model.compile(
-        loss=tf.keras.losses.Hinge(),
-        optimizer=optimizer,
-        metrics=[hinge_accuracy]
-    )
+    # Dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, worker_init_fn=seed_worker)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
-    # 7) Treina
-    history = model.fit(
-        x_train_tfcirc, y_train_hinge,
-        batch_size=batch_size,
-        epochs=epochs,
-        validation_data=(x_test_tfcirc, y_test_hinge),
-        verbose=1
-    )
+    # Modelo
+    model = get_segmentation_model(num_classes=num_classes, fine_tune=True)
 
-    # 8) Avalia
-    results = model.evaluate(x_test_tfcirc, y_test_hinge, verbose=0)
-    # results = [loss, hinge_accuracy]
+    # Otimizador e função de perda
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # 9) Integração com Hardware Quântico (Opcional)
-    if use_hardware:
-        try:
-            # Carregar a conta IBMQ
-            IBMQ.load_account()
-            provider = IBMQ.get_provider(hub='ibm-q')  # Ajuste conforme necessário
-            backend = least_busy(provider.backends(filters=lambda b: b.configuration().n_qubits >= 4 and 
-                                                           not b.configuration().simulator and b.status().operational==True))
-            st.write(f"Backend selecionado para execução real: {backend.name()}")
-        except Exception as e:
-            st.error(f"Erro ao conectar ao hardware quântico: {e}")
-            backend = Aer.get_backend(backend_name)
+    # Treinamento
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
 
-    else:
-        # Usar backend simulado
-        backend = Aer.get_backend(backend_name)
-        st.write(f"Usando backend simulado: {backend_name}")
+        for inputs, masks in train_loader:
+            inputs = inputs.to(device)
+            masks = masks.to(device).long().squeeze(1)  # Ajustar dimensões
 
-    # Retorna o modelo, histórico e backend utilizado
-    return model, history, results, backend
+            optimizer.zero_grad()
+            outputs = model(inputs)['out']
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Treino: {epoch_loss:.4f}')
+
+        # Validação
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, masks in val_loader:
+                inputs = inputs.to(device)
+                masks = masks.to(device).long().squeeze(1)
+
+                outputs = model(inputs)['out']
+                loss = criterion(outputs, masks)
+                val_loss += loss.item() * inputs.size(0)
+
+        val_epoch_loss = val_loss / len(val_loader.dataset)
+        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Validação: {val_epoch_loss:.4f}')
+
+    return model
 
 def main():
     # Definir o caminho do ícone
@@ -1219,13 +1118,10 @@ def main():
     # Barra Lateral de Configurações
     st.sidebar.title("Configurações do Treinamento")
 
-    # Adicionar seleção de modo
-    mode = st.sidebar.selectbox(
-        "Modo de Treinamento:",
-        options=["Clássico (PyTorch)", "Quântico (TFQ)"],
-        index=0,
-        key="mode_selection"
-    )
+    # Seleção de modo - Apenas Clássico
+    mode = "Clássico (PyTorch)"  # Definido fixamente
+
+    st.sidebar.markdown(f"**Modo Selecionado:** {mode}")
 
     if mode == "Clássico (PyTorch)":
         num_classes = st.sidebar.number_input("Número de Classes:", min_value=2, step=1, key="num_classes")
@@ -1239,36 +1135,6 @@ def main():
         l2_lambda = st.sidebar.number_input("L2 Regularization (Weight Decay):", min_value=0.0, max_value=0.1, value=0.01, step=0.01, key="l2_lambda")
         patience = st.sidebar.number_input("Paciência para Early Stopping:", min_value=1, max_value=10, value=3, step=1, key="patience")
         use_weighted_loss = st.sidebar.checkbox("Usar Perda Ponderada para Classes Desbalanceadas", value=False, key="use_weighted_loss")
-    elif mode == "Quântico (TFQ)":
-        # Configurações para o modo quântico
-        epochs_q = st.sidebar.slider("Número de Épocas (Quântico):", min_value=1, max_value=20, value=3, step=1, key="epochs_q")
-        batch_size_q = st.sidebar.selectbox("Tamanho de Lote (Quântico):", options=[4, 8, 16, 32, 64], index=2, key="batch_size_q")
-        threshold_q = st.sidebar.slider("Threshold para Binarização [0,1] (Quântico):", 0.0, 1.0, 0.5, step=0.05, key="threshold_q")
-        circuit_type = st.sidebar.selectbox("Tipo de Circuito:", options=['Basic', 'Entangling', 'Rotation'], key="circuit_type")
-        optimizer_type = st.sidebar.selectbox("Tipo de Otimizador:", options=['Adam', 'SGD', 'RMSprop'], key="optimizer_type")
-        use_hardware = st.sidebar.checkbox("Usar Hardware Quântico Real (IBM Quantum)", value=False, key="use_hardware")
-        if use_hardware:
-            backend_name = 'qasm_simulator'  # Por padrão, usar simulador se hardware real não estiver configurado
-            try:
-                # Carregar a conta IBMQ
-                provider = IBMQ.load_account()
-                # Selecionar o backend menos ocupado
-                backend = least_busy(provider.backends(filters=lambda b: b.configuration().n_qubits >= 4 and 
-                                                               not b.configuration().simulator and b.status().operational==True))
-                backend_name = backend.name()
-                st.sidebar.success(f"Backend selecionado para execução real: {backend_name}")
-            except Exception as e:
-                st.sidebar.error(f"Erro ao conectar ao hardware quântico: {e}")
-                st.sidebar.info("Usando backend simulado padrão.")
-                backend_name = 'statevector_simulator'
-        else:
-            backend_name = 'statevector_simulator'
-            st.sidebar.info(f"Usando backend simulado: {backend_name}")
-
-        # Mensagem clara de modo experimental
-        st.sidebar.warning(
-            "⚠️ **Modo Quântico Experimental:** Atualmente, os modelos quânticos não superam os modelos clássicos (CNNs) para tarefas de classificação de imagens. Utilize este modo para fins educacionais e exploratórios."
-        )
 
     # Opções de carregamento do modelo
     st.header("Opções de Carregamento do Modelo")
@@ -1307,26 +1173,6 @@ def main():
                         st.error("Por favor, forneça o arquivo com as classes.")
                 else:
                     st.warning("Por favor, forneça o número de classes correto.")
-        elif mode == "Quântico (TFQ)":
-            # Upload do modelo quântico pré-treinado
-            q_model_file = st.file_uploader("Faça upload do arquivo do modelo quântico (.h5)", type=["h5"], key="q_model_file_uploader_main")
-            if q_model_file is not None:
-                try:
-                    q_model = tf.keras.models.load_model(q_model_file, compile=False)
-                    st.session_state['q_model'] = q_model
-                    st.success("Modelo quântico carregado com sucesso!")
-                except Exception as e:
-                    st.error(f"Erro ao carregar o modelo quântico: {e}")
-                    return
-
-                # Carregar as classes
-                classes_file_q = st.file_uploader("Faça upload do arquivo com as classes (classes_quantic.txt)", type=["txt"], key="classes_file_uploader_quantic")
-                if classes_file_q is not None:
-                    classes_q = classes_file_q.read().decode("utf-8").splitlines()
-                    st.session_state['classes'] = classes_q
-                    st.write(f"Classes carregadas: {classes_q}")
-                else:
-                    st.error("Por favor, forneça o arquivo com as classes quânticas.")
     elif model_option == "Treinar um novo modelo":
         # Upload do arquivo ZIP
         zip_file = st.file_uploader("Upload do arquivo ZIP com as imagens", type=["zip"], key="zip_file_uploader")
@@ -1380,57 +1226,8 @@ def main():
                     shutil.rmtree(temp_dir)
                 else:
                     st.warning("Por favor, forneça os dados e as configurações corretas para o modo clássico.")
-            elif mode == "Quântico (TFQ)":
-                if epochs_q > 0 and batch_size_q > 0:
-                    # Treinamento quântico baseado no MNIST 3 vs. 6
-                    st.write("Iniciando o treinamento do modelo quântico...")
-                    q_model, q_history, q_results, backend = train_quantum_model(
-                        epochs=epochs_q, 
-                        batch_size=batch_size_q,
-                        threshold=threshold_q,
-                        circuit_type=circuit_type,
-                        optimizer_type=optimizer_type,
-                        use_hardware=use_hardware,
-                        backend_name=backend_name
-                    )
-                    if q_model is not None:
-                        st.success("Treinamento do modelo quântico concluído!")
-
-                        # Exibir resultados
-                        st.write("**Resultados de Teste (Loss, Hinge Accuracy):**", q_results)
-
-                        # Plotar histórico de perda
-                        fig, ax = plt.subplots()
-                        ax.plot(q_history.history['loss'], label='Treino')
-                        ax.plot(q_history.history['val_loss'], label='Validação')
-                        ax.set_title("Evolução da Perda (QNN)")
-                        ax.set_xlabel("Épocas")
-                        ax.set_ylabel("Perda")
-                        ax.legend()
-                        st.pyplot(fig)
-                        plt.close(fig)
-
-                        # Salvar o modelo quântico
-                        q_model.save("quantum_model.h5")
-                        st.write("Modelo quântico salvo como `quantum_model.h5`.")
-
-                        # Salvar as classes em um arquivo
-                        # Como o treinamento quântico foi feito com MNIST 3 vs. 6, as classes são fixas
-                        classes_q = ["3", "6"]
-                        classes_data_q = "\n".join(classes_q)
-                        st.download_button(
-                            label="Download das Classes (Quântico)",
-                            data=classes_data_q,
-                            file_name="classes_quantic.txt",
-                            mime="text/plain",
-                            key="download_classes_quantic_button"
-                        )
-                    else:
-                        st.error("Erro no treinamento do modelo quântico.")
-                else:
-                    st.warning("Por favor, forneça os dados e as configurações corretas para o modo quântico.")
-        else:
-            st.warning("Por favor, forneça os dados e as configurações corretas.")
+    else:
+        st.warning("Por favor, forneça os dados e as configurações corretas.")
 
     # Avaliação de uma imagem individual
     st.header("Avaliação de Imagem")
@@ -1467,919 +1264,11 @@ def main():
 
                     # Visualizar ativações e segmentação
                     visualize_activations(model_eval, eval_image, classes_eval, model_name_eval, segmentation_model=segmentation_model, segmentation=segmentation)
-            elif mode == "Quântico (TFQ)":
-                # Verificar se o modelo quântico está carregado ou treinado
-                if 'q_model' not in st.session_state or 'classes' not in st.session_state:
-                    st.warning("Nenhum modelo quântico carregado ou treinado. Por favor, carregue um modelo quântico existente ou treine um novo modelo.")
-                else:
-                    q_model_eval = st.session_state['q_model']
-                    classes_eval = st.session_state['classes']  # Para o modo quântico, classes devem ser ["3", "6"]
-
-                    # Preparar a imagem para o modelo quântico
-                    # Reduzir para 4x4 e binarizar
-                    image_tensor = tf.image.resize(np.array(eval_image), (4,4))[..., np.newaxis] / 255.0
-                    image_bin = (image_tensor > threshold_q).numpy().astype(np.float32).flatten()
-
-                    # Converter para circuito
-                    def convert_to_circuit_q(image_bin):
-                        qubits = cirq.GridQubit.rect(4,4)
-                        circuit = cirq.Circuit()
-                        for i, v in enumerate(image_bin):
-                            if v:
-                                circuit.append(cirq.X(qubits[i]))
-                        return circuit
-
-                    circuit = convert_to_circuit_q(image_bin)
-                    x_eval_circ = tfq.convert_to_tensor([circuit])
-
-                    # Fazer a previsão
-                    y_pred = q_model_eval.predict(x_eval_circ)
-                    # y_pred está na faixa [-1, 1] devido ao uso de Hinge Loss
-                    predicted_label = 1 if y_pred[0][0] > 0 else 0
-                    confidence_q = abs(y_pred[0][0])
-
-                    class_name = classes_eval[predicted_label]
-                    st.write(f"**Classe Predita (Quântico):** {class_name}")
-                    st.write(f"**Confiança (Quântico):** {confidence_q:.4f}")
-
-                    # Visualizar ativações - Grad-CAM não está implementado para modelos quânticos
-                    st.write("Visualização de ativações não está disponível para o modo quântico.")
-
     st.write("### Documentação dos Procedimentos")
     st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
 
     # Encerrar a aplicação
     st.write("Obrigado por utilizar o aplicativo!")
-
-def train_segmentation_model(images_dir, masks_dir, num_classes):
-    """
-    Treina o modelo de segmentação com o conjunto de dados fornecido pelo usuário.
-    """
-    set_seed(42)
-    batch_size = 4
-    num_epochs = 25
-    learning_rate = 0.001
-
-    # Transformações
-    input_transforms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
-    target_transforms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
-
-    # Dataset
-    dataset = SegmentationDataset(images_dir, masks_dir, transform=input_transforms, target_transform=target_transforms)
-
-    # Dividir em treino e validação
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    if train_size == 0 or val_size == 0:
-        st.error("Conjunto de dados de segmentação muito pequeno para dividir em treino e validação.")
-        return None
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-    # Dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, worker_init_fn=seed_worker)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
-
-    # Modelo
-    model = get_segmentation_model(num_classes=num_classes, fine_tune=True)
-
-    # Otimizador e função de perda
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-    # Treinamento
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-
-        for inputs, masks in train_loader:
-            inputs = inputs.to(device)
-            masks = masks.to(device).long().squeeze(1)  # Ajustar dimensões
-
-            optimizer.zero_grad()
-            outputs = model(inputs)['out']
-            loss = criterion(outputs, masks)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * inputs.size(0)
-
-        epoch_loss = running_loss / len(train_loader.dataset)
-        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Treino: {epoch_loss:.4f}')
-
-        # Validação
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, masks in val_loader:
-                inputs = inputs.to(device)
-                masks = masks.to(device).long().squeeze(1)
-
-                outputs = model(inputs)['out']
-                loss = criterion(outputs, masks)
-                val_loss += loss.item() * inputs.size(0)
-
-        val_loss = val_loss / len(val_loader.dataset)
-        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Validação: {val_loss:.4f}')
-
-    return model
-
-# Funções de plotagem e métricas (sem alterações)
-def plot_metrics(train_losses, valid_losses, train_accuracies, valid_accuracies):
-    """
-    Plota os gráficos de perda e acurácia.
-    """
-    epochs_range = range(1, len(train_losses) + 1)
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Gráfico de Perda
-    ax[0].plot(epochs_range, train_losses, label='Treino')
-    ax[0].plot(epochs_range, valid_losses, label='Validação')
-    ax[0].set_title(f'Perda por Época ({timestamp})')
-    ax[0].set_xlabel('Épocas')
-    ax[0].set_ylabel('Perda')
-    ax[0].legend()
-
-    # Gráfico de Acurácia
-    ax[1].plot(epochs_range, train_accuracies, label='Treino')
-    ax[1].plot(epochs_range, valid_accuracies, label='Validação')
-    ax[1].set_title(f'Acurácia por Época ({timestamp})')
-    ax[1].set_xlabel('Épocas')
-    ax[1].set_ylabel('Acurácia')
-    ax[1].legend()
-
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-def compute_metrics(model, dataloader, classes):
-    """
-    Calcula métricas detalhadas e exibe matriz de confusão e relatório de classificação.
-    """
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-
-            outputs = model(inputs)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probabilities.cpu().numpy())
-
-    # Relatório de Classificação
-    report = classification_report(all_labels, all_preds, target_names=classes, output_dict=True)
-    st.text("Relatório de Classificação:")
-    st.write(pd.DataFrame(report).transpose())
-
-    # Matriz de Confusão Normalizada
-    cm = confusion_matrix(all_labels, all_preds, normalize='true')
-    fig, ax = plt.subplots()
-    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', xticklabels=classes, yticklabels=classes, ax=ax)
-    ax.set_xlabel('Predito')
-    ax.set_ylabel('Verdadeiro')
-    ax.set_title('Matriz de Confusão Normalizada')
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-    # Curva ROC
-    if len(classes) == 2:
-        fpr, tpr, thresholds = roc_curve(all_labels, [p[1] for p in all_probs])
-        roc_auc = roc_auc_score(all_labels, [p[1] for p in all_probs])
-        fig, ax = plt.subplots()
-        ax.plot(fpr, tpr, label='AUC = %0.2f' % roc_auc)
-        ax.plot([0, 1], [0, 1], 'k--')
-        ax.set_xlabel('Taxa de Falsos Positivos')
-        ax.set_ylabel('Taxa de Verdadeiros Positivos')
-        ax.set_title('Curva ROC')
-        ax.legend(loc='lower right')
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-    else:
-        # Multiclasse
-        binarized_labels = label_binarize(all_labels, classes=range(len(classes)))
-        roc_auc = roc_auc_score(binarized_labels, np.array(all_probs), average='weighted', multi_class='ovr')
-        st.write(f"AUC-ROC Média Ponderada: {roc_auc:.4f}")
-
-def error_analysis(model, dataloader, classes):
-    """
-    Realiza análise de erros mostrando algumas imagens mal classificadas.
-    """
-    model.eval()
-    misclassified_images = []
-    misclassified_labels = []
-    misclassified_preds = []
-
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-
-            incorrect = preds != labels
-            if incorrect.any():
-                misclassified_images.extend(inputs[incorrect].cpu())
-                misclassified_labels.extend(labels[incorrect].cpu())
-                misclassified_preds.extend(preds[incorrect].cpu())
-                if len(misclassified_images) >= 5:
-                    break
-
-    if misclassified_images:
-        st.write("Algumas imagens mal classificadas:")
-        fig, axes = plt.subplots(1, min(5, len(misclassified_images)), figsize=(15, 3))
-        for i in range(min(5, len(misclassified_images))):
-            image = misclassified_images[i]
-            image = image.permute(1, 2, 0).numpy()
-            axes[i].imshow(image)
-            axes[i].set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
-            axes[i].axis('off')
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-    else:
-        st.write("Nenhuma imagem mal classificada encontrada.")
-
-def perform_clustering(model, dataloader, classes):
-    """
-    Realiza a extração de features e aplica algoritmos de clusterização.
-    """
-    # Extrair features usando o modelo pré-treinado
-    features = []
-    labels = []
-
-    # Remover a última camada (classificador)
-    if isinstance(model, nn.Sequential):
-        model_feat = model
-    else:
-        model_feat = nn.Sequential(*list(model.children())[:-1])
-    model_feat.eval()
-    model_feat.to(device)
-
-    with torch.no_grad():
-        for inputs, label in dataloader:
-            inputs = inputs.to(device)
-            output = model_feat(inputs)
-            output = output.view(output.size(0), -1)
-            features.append(output.cpu().numpy())
-            labels.extend(label.numpy())
-
-    features = np.vstack(features)
-    labels = np.array(labels)
-
-    # Redução de dimensionalidade com PCA
-    pca = PCA(n_components=2)
-    features_2d = pca.fit_transform(features)
-
-    # Clusterização com KMeans
-    kmeans = KMeans(n_clusters=len(classes), random_state=42)
-    clusters_kmeans = kmeans.fit_predict(features)
-
-    # Clusterização Hierárquica
-    agglo = AgglomerativeClustering(n_clusters=len(classes))
-    clusters_agglo = agglo.fit_predict(features)
-
-    # Plotagem dos resultados
-    fig, ax = plt.subplots(1, 2, figsize=(14, 6))
-
-    # Gráfico KMeans
-    scatter = ax[0].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_kmeans, cmap='viridis')
-    legend1 = ax[0].legend(*scatter.legend_elements(), title="Clusters")
-    ax[0].add_artist(legend1)
-    ax[0].set_title('Clusterização com KMeans')
-
-    # Gráfico Agglomerative Clustering
-    scatter = ax[1].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_agglo, cmap='viridis')
-    legend1 = ax[1].legend(*scatter.legend_elements(), title="Clusters")
-    ax[1].add_artist(legend1)
-    ax[1].set_title('Clusterização Hierárquica')
-
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-    # Métricas de Avaliação
-    ari_kmeans = adjusted_rand_score(labels, clusters_kmeans)
-    nmi_kmeans = normalized_mutual_info_score(labels, clusters_kmeans)
-    ari_agglo = adjusted_rand_score(labels, clusters_agglo)
-    nmi_agglo = normalized_mutual_info_score(labels, clusters_agglo)
-
-    st.write(f"**KMeans** - ARI: {ari_kmeans:.4f}, NMI: {nmi_kmeans:.4f}")
-    st.write(f"**Agglomerative Clustering** - ARI: {ari_agglo:.4f}, NMI: {nmi_agglo:.4f}")
-
-def evaluate_image(model, image, classes):
-    """
-    Avalia uma única imagem e retorna a classe predita e a confiança.
-    """
-    model.eval()
-    image_tensor = test_transforms(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        output = model(image_tensor)
-        probabilities = torch.nn.functional.softmax(output, dim=1)
-        confidence, predicted = torch.max(probabilities, 1)
-        class_idx = predicted.item()
-        class_name = classes[class_idx]
-        return class_name, confidence.item()
-
-def label_to_color_image(label):
-    """
-    Mapeia uma máscara de segmentação para uma imagem colorida.
-    """
-    colormap = create_pascal_label_colormap()
-    return colormap[label]
-
-def create_pascal_label_colormap():
-    """
-    Cria um mapa de cores para o conjunto de dados PASCAL VOC.
-    """
-    colormap = np.zeros((256, 3), dtype=int)
-    ind = np.arange(256, dtype=int)
-
-    for shift in reversed(range(8)):
-        for channel in range(3):
-            colormap[:, channel] |= ((ind >> channel) & 1) << shift
-        ind >>= 3
-
-    return colormap
-
-def visualize_activations(model, image, class_names, model_name, segmentation_model=None, segmentation=False):
-    """
-    Visualiza as ativações na imagem usando Grad-CAM e adiciona a segmentação de objetos.
-    """
-    model.eval()  # Coloca o modelo em modo de avaliação
-    input_tensor = test_transforms(image).unsqueeze(0).to(device)
-
-    # Verificar se o modelo é suportado
-    if model_name.startswith('ResNet'):
-        target_layer = 'layer4'
-    elif model_name.startswith('DenseNet'):
-        target_layer = 'features.denseblock4'
-    else:
-        st.error("Modelo não suportado para Grad-CAM.")
-        return
-
-    # Criar o objeto CAM usando torchcam
-    cam_extractor = SmoothGradCAMpp(model, target_layer=target_layer)
-
-    # Ativar Grad-CAM
-    with torch.set_grad_enabled(True):
-        out = model(input_tensor)  # Faz a previsão
-        probabilities = torch.nn.functional.softmax(out, dim=1)
-        confidence, pred = torch.max(probabilities, 1)  # Obtém a classe predita
-        pred_class = pred.item()
-
-        # Gerar o mapa de ativação
-        activation_map = cam_extractor(pred_class, out)
-
-    # Converter o mapa de ativação para PIL Image
-    activation_map = activation_map[0]
-    result = overlay_mask(to_pil_image(input_tensor.squeeze().cpu()), to_pil_image(activation_map.squeeze(), mode='F'), alpha=0.5)
-
-    # Converter a imagem para array NumPy
-    image_np = np.array(image)
-
-    if segmentation and segmentation_model is not None:
-        # Aplicar o modelo de segmentação
-        segmentation_model.eval()
-        with torch.no_grad():
-            segmentation_output = segmentation_model(input_tensor)['out']
-            segmentation_mask = torch.argmax(segmentation_output.squeeze(), dim=0).cpu().numpy()
-
-        # Mapear o índice da classe para uma cor
-        segmentation_colored = label_to_color_image(segmentation_mask).astype(np.uint8)
-        segmentation_colored = cv2.resize(segmentation_colored, (image.size[0], image.size[1]))
-
-        # Exibir as imagens: Imagem Original, Grad-CAM e Segmentação
-        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-
-        # Imagem original
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[0].axis('off')
-
-        # Imagem com Grad-CAM
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[1].axis('off')
-
-        # Imagem com Segmentação
-        ax[2].imshow(image_np)
-        ax[2].imshow(segmentation_colored, alpha=0.6)
-        ax[2].set_title('Segmentação')
-        ax[2].axis('off')
-
-        # Exibir as imagens com o Streamlit
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-    else:
-        # Exibir as imagens: Imagem Original e Grad-CAM
-        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-
-        # Imagem original
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[0].axis('off')
-
-        # Imagem com Grad-CAM
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[1].axis('off')
-
-        # Exibir as imagens com o Streamlit
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-
-def train_quantum_model(
-    epochs=3, 
-    batch_size=32, 
-    threshold=0.5,
-    circuit_type='Basic',
-    optimizer_type='Adam',
-    use_hardware=False,
-    backend_name='statevector_simulator'
-):
-    """
-    Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
-    Possibilita a integração com hardware quântico real via Qiskit (opcional).
-    
-    Retorna o modelo Keras treinado, histórico e backend utilizado.
-    """
-    # 1) Carregar MNIST e filtrar dígitos 3 e 6
-    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
-    x_train, x_test = x_train / 255.0, x_test / 255.0
-
-    def filter_36(x, y):
-        keep = (y == 3) | (y == 6)
-        x, y = x[keep], y[keep]
-        y = (y == 3)
-        return x, y
-
-    x_train, y_train = filter_36(x_train, y_train)
-    x_test, y_test = filter_36(x_test, y_test)
-
-    # Reduz a imagem para 4×4
-    x_train_small = tf.image.resize(x_train[..., np.newaxis], (4,4)).numpy()
-    x_test_small  = tf.image.resize(x_test[..., np.newaxis], (4,4)).numpy()
-
-    # Binariza
-    x_train_bin = np.array(x_train_small > threshold, dtype=np.float32)
-    x_test_bin  = np.array(x_test_small  > threshold, dtype=np.float32)
-
-    # 2) Converte cada imagem em um circuito Cirq
-    def convert_to_circuit(image):
-        values = image.flatten()
-        qubits = cirq.GridQubit.rect(4,4)
-        circuit = cirq.Circuit()
-        for i, v in enumerate(values):
-            if v:  # se for 1, aplica X
-                circuit.append(cirq.X(qubits[i]))
-        return circuit
-
-    x_train_circ = [convert_to_circuit(img) for img in x_train_bin]
-    x_test_circ  = [convert_to_circuit(img) for img in x_test_bin]
-
-    # Converte para tensores
-    x_train_tfcirc = tfq.convert_to_tensor(x_train_circ)
-    x_test_tfcirc  = tfq.convert_to_tensor(x_test_circ)
-
-    # 3) Define o circuito parametrizado baseado no tipo selecionado
-    def create_quantum_model(circuit_type='Basic'):
-        data_qubits = cirq.GridQubit.rect(4,4)
-        readout = cirq.GridQubit(-1, -1)
-
-        circuit = cirq.Circuit()
-        # Prepara qubit de leitura
-        circuit.append([cirq.X(readout), cirq.H(readout)])
-
-        if circuit_type == 'Basic':
-            # Exemplo de duas camadas com gates XX e ZZ
-            def add_layer(circuit, gate, prefix):
-                for i, qubit in enumerate(data_qubits):
-                    sym = sympy.Symbol(prefix + f'-{i}')
-                    circuit.append(gate(qubit, readout) ** sym)
-
-            add_layer(circuit, cirq.XX, "xx1")
-            add_layer(circuit, cirq.ZZ, "zz1")
-        elif circuit_type == 'Entangling':
-            # Circuito com gates de entanglement
-            def add_entangling_layer(circuit, gate, prefix):
-                for i in range(len(data_qubits)-1):
-                    sym = sympy.Symbol(prefix + f'-{i}')
-                    circuit.append(gate(data_qubits[i], data_qubits[i+1]) ** sym)
-
-            add_entangling_layer(circuit, cirq.CNOT, "cnot1")
-            add_entangling_layer(circuit, cirq.CZ, "cz1")
-        elif circuit_type == 'Rotation':
-            # Circuito com rotações parametrizadas
-            def add_rotation_layer(circuit, gate, prefix):
-                for i, qubit in enumerate(data_qubits):
-                    sym = sympy.Symbol(prefix + f'-{i}')
-                    circuit.append(gate(qubit) ** sym)
-
-            add_rotation_layer(circuit, cirq.ry, "ry1")
-            add_rotation_layer(circuit, cirq.rx, "rx1")
-        else:
-            st.error("Tipo de circuito não suportado.")
-            return None, None
-
-        # Finaliza com H no readout
-        circuit.append(cirq.H(readout))
-        return circuit, cirq.Z(readout)
-
-    q_circuit, q_readout = create_quantum_model(circuit_type=circuit_type)
-    if q_circuit is None:
-        return None, None, None, None
-
-    # 4) Define o otimizador baseado no tipo selecionado
-    if optimizer_type == 'Adam':
-        optimizer = tf.keras.optimizers.Adam()
-    elif optimizer_type == 'SGD':
-        optimizer = tf.keras.optimizers.SGD()
-    elif optimizer_type == 'RMSprop':
-        optimizer = tf.keras.optimizers.RMSprop()
-    else:
-        st.error("Tipo de otimizador não suportado.")
-        return None, None, None, None
-
-    # 5) Configura a camada PQC e o modelo Keras
-    model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(), dtype=tf.string),
-        tfq.layers.PQC(q_circuit, q_readout)
-    ])
-
-    # 6) Configura loss e métricas
-    y_train_hinge = 2.0*y_train - 1.0
-    y_test_hinge  = 2.0*y_test  - 1.0
-
-    def hinge_accuracy(y_true, y_pred):
-        y_t = tf.squeeze(y_true) > 0
-        y_p = tf.squeeze(y_pred) > 0
-        return tf.reduce_mean(tf.cast(y_t == y_p, tf.float32))
-
-    model.compile(
-        loss=tf.keras.losses.Hinge(),
-        optimizer=optimizer,
-        metrics=[hinge_accuracy]
-    )
-
-    # 7) Treina
-    history = model.fit(
-        x_train_tfcirc, y_train_hinge,
-        batch_size=batch_size,
-        epochs=epochs,
-        validation_data=(x_test_tfcirc, y_test_hinge),
-        verbose=1
-    )
-
-    # 8) Avalia
-    results = model.evaluate(x_test_tfcirc, y_test_hinge, verbose=0)
-    # results = [loss, hinge_accuracy]
-
-    # 9) Integração com Hardware Quântico (Opcional)
-    if use_hardware:
-        try:
-            # Carregar a conta IBMQ
-            provider = IBMQ.load_account()
-            # Selecionar o backend menos ocupado
-            backend = least_busy(provider.backends(filters=lambda b: b.configuration().n_qubits >= 4 and 
-                                                           not b.configuration().simulator and b.status().operational==True))
-            backend_name = backend.name()
-            st.write(f"Backend selecionado para execução real: {backend_name}")
-        except Exception as e:
-            st.error(f"Erro ao conectar ao hardware quântico: {e}")
-            st.info("Usando backend simulado padrão.")
-            backend = Aer.get_backend(backend_name)
-    else:
-        # Usar backend simulado
-        backend = Aer.get_backend(backend_name)
-        st.write(f"Usando backend simulado: {backend_name}")
-
-    # Retorna o modelo, histórico, resultados e backend utilizado
-    return model, history, results, backend
-
-# Funções de plotagem e métricas (sem alterações)
-def plot_metrics(train_losses, valid_losses, train_accuracies, valid_accuracies):
-    """
-    Plota os gráficos de perda e acurácia.
-    """
-    epochs_range = range(1, len(train_losses) + 1)
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Gráfico de Perda
-    ax[0].plot(epochs_range, train_losses, label='Treino')
-    ax[0].plot(epochs_range, valid_losses, label='Validação')
-    ax[0].set_title(f'Perda por Época ({timestamp})')
-    ax[0].set_xlabel('Épocas')
-    ax[0].set_ylabel('Perda')
-    ax[0].legend()
-
-    # Gráfico de Acurácia
-    ax[1].plot(epochs_range, train_accuracies, label='Treino')
-    ax[1].plot(epochs_range, valid_accuracies, label='Validação')
-    ax[1].set_title(f'Acurácia por Época ({timestamp})')
-    ax[1].set_xlabel('Épocas')
-    ax[1].set_ylabel('Acurácia')
-    ax[1].legend()
-
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-def compute_metrics(model, dataloader, classes):
-    """
-    Calcula métricas detalhadas e exibe matriz de confusão e relatório de classificação.
-    """
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-
-            outputs = model(inputs)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probabilities.cpu().numpy())
-
-    # Relatório de Classificação
-    report = classification_report(all_labels, all_preds, target_names=classes, output_dict=True)
-    st.text("Relatório de Classificação:")
-    st.write(pd.DataFrame(report).transpose())
-
-    # Matriz de Confusão Normalizada
-    cm = confusion_matrix(all_labels, all_preds, normalize='true')
-    fig, ax = plt.subplots()
-    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', xticklabels=classes, yticklabels=classes, ax=ax)
-    ax.set_xlabel('Predito')
-    ax.set_ylabel('Verdadeiro')
-    ax.set_title('Matriz de Confusão Normalizada')
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-    # Curva ROC
-    if len(classes) == 2:
-        fpr, tpr, thresholds = roc_curve(all_labels, [p[1] for p in all_probs])
-        roc_auc = roc_auc_score(all_labels, [p[1] for p in all_probs])
-        fig, ax = plt.subplots()
-        ax.plot(fpr, tpr, label='AUC = %0.2f' % roc_auc)
-        ax.plot([0, 1], [0, 1], 'k--')
-        ax.set_xlabel('Taxa de Falsos Positivos')
-        ax.set_ylabel('Taxa de Verdadeiros Positivos')
-        ax.set_title('Curva ROC')
-        ax.legend(loc='lower right')
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-    else:
-        # Multiclasse
-        binarized_labels = label_binarize(all_labels, classes=range(len(classes)))
-        roc_auc = roc_auc_score(binarized_labels, np.array(all_probs), average='weighted', multi_class='ovr')
-        st.write(f"AUC-ROC Média Ponderada: {roc_auc:.4f}")
-
-def error_analysis(model, dataloader, classes):
-    """
-    Realiza análise de erros mostrando algumas imagens mal classificadas.
-    """
-    model.eval()
-    misclassified_images = []
-    misclassified_labels = []
-    misclassified_preds = []
-
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-
-            incorrect = preds != labels
-            if incorrect.any():
-                misclassified_images.extend(inputs[incorrect].cpu())
-                misclassified_labels.extend(labels[incorrect].cpu())
-                misclassified_preds.extend(preds[incorrect].cpu())
-                if len(misclassified_images) >= 5:
-                    break
-
-    if misclassified_images:
-        st.write("Algumas imagens mal classificadas:")
-        fig, axes = plt.subplots(1, min(5, len(misclassified_images)), figsize=(15, 3))
-        for i in range(min(5, len(misclassified_images))):
-            image = misclassified_images[i]
-            image = image.permute(1, 2, 0).numpy()
-            axes[i].imshow(image)
-            axes[i].set_title(f"V: {classes[misclassified_labels[i]]}\nP: {classes[misclassified_preds[i]]}")
-            axes[i].axis('off')
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-    else:
-        st.write("Nenhuma imagem mal classificada encontrada.")
-
-def perform_clustering(model, dataloader, classes):
-    """
-    Realiza a extração de features e aplica algoritmos de clusterização.
-    """
-    # Extrair features usando o modelo pré-treinado
-    features = []
-    labels = []
-
-    # Remover a última camada (classificador)
-    if isinstance(model, nn.Sequential):
-        model_feat = model
-    else:
-        model_feat = nn.Sequential(*list(model.children())[:-1])
-    model_feat.eval()
-    model_feat.to(device)
-
-    with torch.no_grad():
-        for inputs, label in dataloader:
-            inputs = inputs.to(device)
-            output = model_feat(inputs)
-            output = output.view(output.size(0), -1)
-            features.append(output.cpu().numpy())
-            labels.extend(label.numpy())
-
-    features = np.vstack(features)
-    labels = np.array(labels)
-
-    # Redução de dimensionalidade com PCA
-    pca = PCA(n_components=2)
-    features_2d = pca.fit_transform(features)
-
-    # Clusterização com KMeans
-    kmeans = KMeans(n_clusters=len(classes), random_state=42)
-    clusters_kmeans = kmeans.fit_predict(features)
-
-    # Clusterização Hierárquica
-    agglo = AgglomerativeClustering(n_clusters=len(classes))
-    clusters_agglo = agglo.fit_predict(features)
-
-    # Plotagem dos resultados
-    fig, ax = plt.subplots(1, 2, figsize=(14, 6))
-
-    # Gráfico KMeans
-    scatter = ax[0].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_kmeans, cmap='viridis')
-    legend1 = ax[0].legend(*scatter.legend_elements(), title="Clusters")
-    ax[0].add_artist(legend1)
-    ax[0].set_title('Clusterização com KMeans')
-
-    # Gráfico Agglomerative Clustering
-    scatter = ax[1].scatter(features_2d[:, 0], features_2d[:, 1], c=clusters_agglo, cmap='viridis')
-    legend1 = ax[1].legend(*scatter.legend_elements(), title="Clusters")
-    ax[1].add_artist(legend1)
-    ax[1].set_title('Clusterização Hierárquica')
-
-    st.pyplot(fig)
-    plt.close(fig)  # Fechar a figura para liberar memória
-
-    # Métricas de Avaliação
-    ari_kmeans = adjusted_rand_score(labels, clusters_kmeans)
-    nmi_kmeans = normalized_mutual_info_score(labels, clusters_kmeans)
-    ari_agglo = adjusted_rand_score(labels, clusters_agglo)
-    nmi_agglo = normalized_mutual_info_score(labels, clusters_agglo)
-
-    st.write(f"**KMeans** - ARI: {ari_kmeans:.4f}, NMI: {nmi_kmeans:.4f}")
-    st.write(f"**Agglomerative Clustering** - ARI: {ari_agglo:.4f}, NMI: {nmi_agglo:.4f}")
-
-def evaluate_image(model, image, classes):
-    """
-    Avalia uma única imagem e retorna a classe predita e a confiança.
-    """
-    model.eval()
-    image_tensor = test_transforms(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        output = model(image_tensor)
-        probabilities = torch.nn.functional.softmax(output, dim=1)
-        confidence, predicted = torch.max(probabilities, 1)
-        class_idx = predicted.item()
-        class_name = classes[class_idx]
-        return class_name, confidence.item()
-
-def label_to_color_image(label):
-    """
-    Mapeia uma máscara de segmentação para uma imagem colorida.
-    """
-    colormap = create_pascal_label_colormap()
-    return colormap[label]
-
-def create_pascal_label_colormap():
-    """
-    Cria um mapa de cores para o conjunto de dados PASCAL VOC.
-    """
-    colormap = np.zeros((256, 3), dtype=int)
-    ind = np.arange(256, dtype=int)
-
-    for shift in reversed(range(8)):
-        for channel in range(3):
-            colormap[:, channel] |= ((ind >> channel) & 1) << shift
-        ind >>= 3
-
-    return colormap
-
-def visualize_activations(model, image, class_names, model_name, segmentation_model=None, segmentation=False):
-    """
-    Visualiza as ativações na imagem usando Grad-CAM e adiciona a segmentação de objetos.
-    """
-    model.eval()  # Coloca o modelo em modo de avaliação
-    input_tensor = test_transforms(image).unsqueeze(0).to(device)
-
-    # Verificar se o modelo é suportado
-    if model_name.startswith('ResNet'):
-        target_layer = 'layer4'
-    elif model_name.startswith('DenseNet'):
-        target_layer = 'features.denseblock4'
-    else:
-        st.error("Modelo não suportado para Grad-CAM.")
-        return
-
-    # Criar o objeto CAM usando torchcam
-    cam_extractor = SmoothGradCAMpp(model, target_layer=target_layer)
-
-    # Ativar Grad-CAM
-    with torch.set_grad_enabled(True):
-        out = model(input_tensor)  # Faz a previsão
-        probabilities = torch.nn.functional.softmax(out, dim=1)
-        confidence, pred = torch.max(probabilities, 1)  # Obtém a classe predita
-        pred_class = pred.item()
-
-        # Gerar o mapa de ativação
-        activation_map = cam_extractor(pred_class, out)
-
-    # Converter o mapa de ativação para PIL Image
-    activation_map = activation_map[0]
-    result = overlay_mask(to_pil_image(input_tensor.squeeze().cpu()), to_pil_image(activation_map.squeeze(), mode='F'), alpha=0.5)
-
-    # Converter a imagem para array NumPy
-    image_np = np.array(image)
-
-    if segmentation and segmentation_model is not None:
-        # Aplicar o modelo de segmentação
-        segmentation_model.eval()
-        with torch.no_grad():
-            segmentation_output = segmentation_model(input_tensor)['out']
-            segmentation_mask = torch.argmax(segmentation_output.squeeze(), dim=0).cpu().numpy()
-
-        # Mapear o índice da classe para uma cor
-        segmentation_colored = label_to_color_image(segmentation_mask).astype(np.uint8)
-        segmentation_colored = cv2.resize(segmentation_colored, (image.size[0], image.size[1]))
-
-        # Exibir as imagens: Imagem Original, Grad-CAM e Segmentação
-        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-
-        # Imagem original
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[0].axis('off')
-
-        # Imagem com Grad-CAM
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[1].axis('off')
-
-        # Imagem com Segmentação
-        ax[2].imshow(image_np)
-        ax[2].imshow(segmentation_colored, alpha=0.6)
-        ax[2].set_title('Segmentação')
-        ax[2].axis('off')
-
-        # Exibir as imagens com o Streamlit
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
-    else:
-        # Exibir as imagens: Imagem Original e Grad-CAM
-        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-
-        # Imagem original
-        ax[0].imshow(image_np)
-        ax[0].set_title('Imagem Original')
-        ax[0].axis('off')
-
-        # Imagem com Grad-CAM
-        ax[1].imshow(result)
-        ax[1].set_title('Grad-CAM')
-        ax[1].axis('off')
-
-        # Exibir as imagens com o Streamlit
-        st.pyplot(fig)
-        plt.close(fig)  # Fechar a figura para liberar memória
 
 if __name__ == "__main__":
     main()
