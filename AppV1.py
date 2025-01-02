@@ -1,4 +1,4 @@
-import os
+import os 
 import zipfile
 import shutil
 import tempfile
@@ -32,6 +32,15 @@ import cv2
 import io
 import warnings
 from datetime import datetime  # Importação para data e hora
+
+# Importações adicionais para o modo quântico
+import tensorflow as tf
+import tensorflow_quantum as tfq
+import cirq
+import sympy
+# Removidas as importações do Qiskit IBM Quantum
+# from qiskit import IBMQ, Aer, transpile
+# from qiskit.providers.ibmq import least_busy
 
 # Supressão dos avisos relacionados ao torch.classes
 warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.classes.*")
@@ -958,6 +967,525 @@ def visualize_activations(model, image, class_names, model_name, segmentation_mo
         st.pyplot(fig)
         plt.close(fig)  # Fechar a figura para liberar memória
 
+def train_quantum_model(
+    epochs=3, 
+    batch_size=32, 
+    threshold=0.5,
+    circuit_type='Basic',
+    optimizer_type='Adam',
+    use_hardware=False,
+    backend_name='statevector_simulator'
+):
+    """
+    Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
+    Possibilita a integração com hardware quântico real via Qiskit (opcional).
+    
+    Retorna o modelo Keras treinado, histórico, resultados e backend utilizado.
+    """
+    # 1) Carregar MNIST e filtrar dígitos 3 e 6
+    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+    x_train, x_test = x_train / 255.0, x_test / 255.0
+
+    def filter_36(x, y):
+        keep = (y == 3) | (y == 6)
+        x, y = x[keep], y[keep]
+        y = (y == 3)
+        return x, y
+
+    x_train, y_train = filter_36(x_train, y_train)
+    x_test, y_test = filter_36(x_test, y_test)
+
+    # Reduz a imagem para 4×4
+    x_train_small = tf.image.resize(x_train[..., np.newaxis], (4,4)).numpy()
+    x_test_small  = tf.image.resize(x_test[..., np.newaxis], (4,4)).numpy()
+
+    # Binariza
+    x_train_bin = np.array(x_train_small > threshold, dtype=np.float32)
+    x_test_bin  = np.array(x_test_small  > threshold, dtype=np.float32)
+
+    # 2) Converte cada imagem em um circuito Cirq
+    def convert_to_circuit(image):
+        values = image.flatten()
+        qubits = cirq.GridQubit.rect(4,4)
+        circuit = cirq.Circuit()
+        for i, v in enumerate(values):
+            if v:  # se for 1, aplica X
+                circuit.append(cirq.X(qubits[i]))
+        return circuit
+
+    x_train_circ = [convert_to_circuit(img) for img in x_train_bin]
+    x_test_circ  = [convert_to_circuit(img) for img in x_test_bin]
+
+    # Converte para tensores
+    x_train_tfcirc = tfq.convert_to_tensor(x_train_circ)
+    x_test_tfcirc  = tfq.convert_to_tensor(x_test_circ)
+
+    # 3) Define o circuito parametrizado baseado no tipo selecionado
+    def create_quantum_model(circuit_type='Basic'):
+        data_qubits = cirq.GridQubit.rect(4,4)
+        readout = cirq.GridQubit(-1, -1)
+
+        circuit = cirq.Circuit()
+        # Prepara qubit de leitura
+        circuit.append([cirq.X(readout), cirq.H(readout)])
+
+        if circuit_type == 'Basic':
+            # Exemplo de duas camadas com gates XX e ZZ
+            def add_layer(circuit, gate, prefix):
+                for i, qubit in enumerate(data_qubits):
+                    sym = sympy.Symbol(prefix + f'-{i}')
+                    circuit.append(gate(qubit, readout) ** sym)
+
+            add_layer(circuit, cirq.XX, "xx1")
+            add_layer(circuit, cirq.ZZ, "zz1")
+        elif circuit_type == 'Entangling':
+            # Circuito com gates de entanglement
+            def add_entangling_layer(circuit, gate, prefix):
+                for i in range(len(data_qubits)-1):
+                    sym = sympy.Symbol(prefix + f'-{i}')
+                    circuit.append(gate(data_qubits[i], data_qubits[i+1]) ** sym)
+
+            add_entangling_layer(circuit, cirq.CNOT, "cnot1")
+            add_entangling_layer(circuit, cirq.CZ, "cz1")
+        elif circuit_type == 'Rotation':
+            # Circuito com rotações parametrizadas
+            def add_rotation_layer(circuit, gate, prefix):
+                for i, qubit in enumerate(data_qubits):
+                    sym = sympy.Symbol(prefix + f'-{i}')
+                    circuit.append(gate(qubit) ** sym)
+
+            add_rotation_layer(circuit, cirq.ry, "ry1")
+            add_rotation_layer(circuit, cirq.rx, "rx1")
+        else:
+            st.error("Tipo de circuito não suportado.")
+            return None, None
+
+        # Finaliza com H no readout
+        circuit.append(cirq.H(readout))
+        return circuit, cirq.Z(readout)
+
+    q_circuit, q_readout = create_quantum_model(circuit_type=circuit_type)
+    if q_circuit is None:
+        return None, None, None, None
+
+    # 4) Define o otimizador baseado no tipo selecionado
+    if optimizer_type == 'Adam':
+        optimizer = tf.keras.optimizers.Adam()
+    elif optimizer_type == 'SGD':
+        optimizer = tf.keras.optimizers.SGD()
+    elif optimizer_type == 'RMSprop':
+        optimizer = tf.keras.optimizers.RMSprop()
+    else:
+        st.error("Tipo de otimizador não suportado.")
+        return None, None, None, None
+
+    # 5) Configura a camada PQC e o modelo Keras
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(), dtype=tf.string),
+        tfq.layers.PQC(q_circuit, q_readout)
+    ])
+
+    # 6) Configura loss e métricas
+    y_train_hinge = 2.0*y_train - 1.0
+    y_test_hinge  = 2.0*y_test  - 1.0
+
+    def hinge_accuracy(y_true, y_pred):
+        y_t = tf.squeeze(y_true) > 0
+        y_p = tf.squeeze(y_pred) > 0
+        return tf.reduce_mean(tf.cast(y_t == y_p, tf.float32))
+
+    model.compile(
+        loss=tf.keras.losses.Hinge(),
+        optimizer=optimizer,
+        metrics=[hinge_accuracy]
+    )
+
+    # 7) Treina
+    history = model.fit(
+        x_train_tfcirc, y_train_hinge,
+        batch_size=batch_size,
+        epochs=epochs,
+        validation_data=(x_test_tfcirc, y_test_hinge),
+        verbose=1
+    )
+
+    # 8) Avalia
+    results = model.evaluate(x_test_tfcirc, y_test_hinge, verbose=0)
+    # results = [loss, hinge_accuracy]
+
+    # 9) Integração com Hardware Quântico (Opcional) - Removida
+    # Como Qiskit IBM Quantum foi removido, apenas informamos que usamos um backend simulado
+    backend = backend_name  # Mantém a referência para compatibilidade
+
+    st.write(f"Usando backend simulado: {backend_name}")
+
+    # Retorna o modelo, histórico, resultados e backend utilizado
+    return model, history, results, backend
+
+def main():
+    # Definir o caminho do ícone
+    icon_path = "logo.png"  # Verifique se o arquivo logo.png está no diretório correto
+
+    # Verificar se o arquivo de ícone existe antes de configurá-lo
+    if os.path.exists(icon_path):
+        try:
+            st.set_page_config(page_title="Geomaker", page_icon=icon_path, layout="wide")
+            logging.info(f"Ícone {icon_path} carregado com sucesso.")
+        except Exception as e:
+            st.set_page_config(page_title="Geomaker", layout="wide")
+            logging.warning(f"Erro ao carregar o ícone {icon_path}: {e}")
+    else:
+        # Se o ícone não for encontrado, carrega sem favicon
+        st.set_page_config(page_title="Geomaker", layout="wide")
+        logging.warning(f"Ícone {icon_path} não encontrado, carregando sem favicon.")
+
+    # Layout da página
+    if os.path.exists('capa.png'):
+        try:
+            st.image('capa.png', width=100, caption='Laboratório de Educação e Inteligência Artificial - Geomaker. "A melhor forma de prever o futuro é inventá-lo." - Alan Kay', use_container_width=True)
+        except UnidentifiedImageError:
+            st.warning("Imagem 'capa.png' não pôde ser carregada ou está corrompida.")
+    else:
+        st.warning("Imagem 'capa.png' não encontrada.")
+
+    # Carregar o logotipo na barra lateral
+    if os.path.exists("logo.png"):
+        try:
+            st.sidebar.image("logo.png", width=200)
+        except UnidentifiedImageError:
+            st.sidebar.text("Imagem do logotipo não pôde ser carregada ou está corrompida.")
+    else:
+        st.sidebar.text("Imagem do logotipo não encontrada.")
+
+    st.title("Classificação e Segmentação de Imagens com Aprendizado Profundo")
+    st.write("Este aplicativo permite treinar um modelo de classificação de imagens, aplicar algoritmos de clustering para análise comparativa e realizar segmentação de objetos.")
+    st.write("As etapas são cuidadosamente documentadas para auxiliar na reprodução e análise científica.")
+
+    # Inicializar segmentation_model
+    segmentation_model = None
+
+    # Opções para o modelo de segmentação
+    st.subheader("Opções para o Modelo de Segmentação")
+    segmentation_option = st.selectbox("Deseja utilizar um modelo de segmentação?", ["Não", "Utilizar modelo pré-treinado", "Treinar novo modelo de segmentação"])
+    if segmentation_option == "Utilizar modelo pré-treinado":
+        num_classes_segmentation = st.number_input("Número de Classes para Segmentação (Modelo Pré-treinado):", min_value=1, step=1, value=21)
+        segmentation_model = get_segmentation_model(num_classes=num_classes_segmentation)
+        st.write("Modelo de segmentação pré-treinado carregado.")
+    elif segmentation_option == "Treinar novo modelo de segmentação":
+        st.write("Treinamento do modelo de segmentação com seu próprio conjunto de dados.")
+        num_classes_segmentation = st.number_input("Número de Classes para Segmentação:", min_value=1, step=1)
+        # Upload do conjunto de dados de segmentação
+        segmentation_zip = st.file_uploader("Faça upload de um arquivo ZIP contendo as imagens e máscaras de segmentação", type=["zip"])
+        if segmentation_zip is not None:
+            temp_seg_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_seg_dir, "segmentation.zip")
+            with open(zip_path, "wb") as f:
+                f.write(segmentation_zip.read())
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_seg_dir)
+
+            # Espera-se que as imagens estejam em 'images/' e as máscaras em 'masks/' dentro do ZIP
+            images_dir = os.path.join(temp_seg_dir, 'images')
+            masks_dir = os.path.join(temp_seg_dir, 'masks')
+
+            if os.path.exists(images_dir) and os.path.exists(masks_dir):
+                # Treinar o modelo de segmentação
+                st.write("Iniciando o treinamento do modelo de segmentação...")
+                segmentation_model = train_segmentation_model(images_dir, masks_dir, num_classes_segmentation)
+                if segmentation_model is not None:
+                    st.success("Treinamento do modelo de segmentação concluído!")
+            else:
+                st.error("Estrutura de diretórios inválida no arquivo ZIP. Certifique-se de que as imagens estão em 'images/' e as máscaras em 'masks/'.")
+        else:
+            st.warning("Aguardando o upload do conjunto de dados de segmentação.")
+    else:
+        segmentation_model = None
+
+    # Barra Lateral de Configurações
+    st.sidebar.title("Configurações do Treinamento")
+
+    # Adicionar seleção de modo
+    mode = st.sidebar.selectbox(
+        "Modo de Treinamento:",
+        options=["Clássico (PyTorch)", "Quântico (TFQ)"],
+        index=0,
+        key="mode_selection"
+    )
+
+    if mode == "Clássico (PyTorch)":
+        num_classes = st.sidebar.number_input("Número de Classes:", min_value=2, step=1, key="num_classes")
+        model_name = st.sidebar.selectbox("Modelo Pré-treinado:", options=['ResNet18', 'ResNet50', 'DenseNet121'], key="model_name")
+        fine_tune = st.sidebar.checkbox("Fine-Tuning Completo", value=False, key="fine_tune")
+        epochs = st.sidebar.slider("Número de Épocas:", min_value=1, max_value=500, value=200, step=1, key="epochs")
+        learning_rate = st.sidebar.select_slider("Taxa de Aprendizagem:", options=[0.1, 0.01, 0.001, 0.0001], value=0.0001, key="learning_rate")
+        batch_size = st.sidebar.selectbox("Tamanho de Lote:", options=[4, 8, 16, 32, 64], index=2, key="batch_size")
+        train_split = st.sidebar.slider("Percentual de Treinamento:", min_value=0.5, max_value=0.9, value=0.7, step=0.05, key="train_split")
+        valid_split = st.sidebar.slider("Percentual de Validação:", min_value=0.05, max_value=0.4, value=0.15, step=0.05, key="valid_split")
+        l2_lambda = st.sidebar.number_input("L2 Regularization (Weight Decay):", min_value=0.0, max_value=0.1, value=0.01, step=0.01, key="l2_lambda")
+        patience = st.sidebar.number_input("Paciência para Early Stopping:", min_value=1, max_value=10, value=3, step=1, key="patience")
+        use_weighted_loss = st.sidebar.checkbox("Usar Perda Ponderada para Classes Desbalanceadas", value=False, key="use_weighted_loss")
+    elif mode == "Quântico (TFQ)":
+        # Configurações para o modo quântico
+        epochs_q = st.sidebar.slider("Número de Épocas (Quântico):", min_value=1, max_value=20, value=3, step=1, key="epochs_q")
+        batch_size_q = st.sidebar.selectbox("Tamanho de Lote (Quântico):", options=[4, 8, 16, 32, 64], index=2, key="batch_size_q")
+        threshold_q = st.sidebar.slider("Threshold para Binarização [0,1] (Quântico):", 0.0, 1.0, 0.5, step=0.05, key="threshold_q")
+        circuit_type = st.sidebar.selectbox("Tipo de Circuito:", options=['Basic', 'Entangling', 'Rotation'], key="circuit_type")
+        optimizer_type = st.sidebar.selectbox("Tipo de Otimizador:", options=['Adam', 'SGD', 'RMSprop'], key="optimizer_type")
+        use_hardware = st.sidebar.checkbox("Usar Hardware Quântico Real (IBM Quantum)", value=False, key="use_hardware")
+        if use_hardware:
+            # Como Qiskit IBM Quantum foi removido, informamos que apenas simuladores são suportados
+            st.sidebar.error("Integração com hardware quântico real removida. Apenas simuladores estão disponíveis.")
+            backend_name = 'statevector_simulator'
+        else:
+            backend_name = 'statevector_simulator'
+            st.sidebar.info(f"Usando backend simulado: {backend_name}")
+
+        # Mensagem clara de modo experimental
+        st.sidebar.warning(
+            "⚠️ **Modo Quântico Experimental:** Atualmente, os modelos quânticos não superam os modelos clássicos (CNNs) para tarefas de classificação de imagens. Utilize este modo para fins educacionais e exploratórios."
+        )
+
+    # Opções de carregamento do modelo
+    st.header("Opções de Carregamento do Modelo")
+
+    model_option = st.selectbox("Escolha uma opção:", ["Treinar um novo modelo", "Carregar um modelo existente"], key="model_option_main")
+    if model_option == "Carregar um modelo existente":
+        if mode == "Clássico (PyTorch)":
+            # Upload do modelo pré-treinado
+            model_file = st.file_uploader("Faça upload do arquivo do modelo (.pt ou .pth)", type=["pt", "pth"], key="model_file_uploader_main")
+            if model_file is not None:
+                if num_classes > 0:
+                    # Carregar o modelo clássico
+                    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False)
+                    if model is None:
+                        st.error("Erro ao carregar o modelo.")
+                        return
+
+                    # Carregar os pesos do modelo
+                    try:
+                        state_dict = torch.load(model_file, map_location=device)
+                        model.load_state_dict(state_dict)
+                        st.session_state['model'] = model
+                        st.session_state['trained_model_name'] = model_name  # Armazena o nome do modelo treinado
+                        st.success("Modelo clássico carregado com sucesso!")
+                    except Exception as e:
+                        st.error(f"Erro ao carregar o modelo: {e}")
+                        return
+
+                    # Carregar as classes
+                    classes_file = st.file_uploader("Faça upload do arquivo com as classes (classes.txt)", type=["txt"], key="classes_file_uploader_main")
+                    if classes_file is not None:
+                        classes = classes_file.read().decode("utf-8").splitlines()
+                        st.session_state['classes'] = classes
+                        st.write(f"Classes carregadas: {classes}")
+                    else:
+                        st.error("Por favor, forneça o arquivo com as classes.")
+                else:
+                    st.warning("Por favor, forneça o número de classes correto.")
+        elif mode == "Quântico (TFQ)":
+            # Upload do modelo quântico pré-treinado
+            q_model_file = st.file_uploader("Faça upload do arquivo do modelo quântico (.h5)", type=["h5"], key="q_model_file_uploader_main")
+            if q_model_file is not None:
+                try:
+                    q_model = tf.keras.models.load_model(q_model_file, compile=False)
+                    st.session_state['q_model'] = q_model
+                    st.success("Modelo quântico carregado com sucesso!")
+                except Exception as e:
+                    st.error(f"Erro ao carregar o modelo quântico: {e}")
+                    return
+
+                # Carregar as classes
+                classes_file_q = st.file_uploader("Faça upload do arquivo com as classes (classes_quantic.txt)", type=["txt"], key="classes_file_uploader_quantic")
+                if classes_file_q is not None:
+                    classes_q = classes_file_q.read().decode("utf-8").splitlines()
+                    st.session_state['classes'] = classes_q
+                    st.write(f"Classes carregadas: {classes_q}")
+                else:
+                    st.error("Por favor, forneça o arquivo com as classes quânticas.")
+    elif model_option == "Treinar um novo modelo":
+        # Upload do arquivo ZIP
+        zip_file = st.file_uploader("Upload do arquivo ZIP com as imagens", type=["zip"], key="zip_file_uploader")
+        if zip_file is not None:
+            if mode == "Clássico (PyTorch)":
+                if num_classes > 0 and train_split + valid_split <= 0.95:
+                    temp_dir = tempfile.mkdtemp()
+                    zip_path = os.path.join(temp_dir, "uploaded.zip")
+                    with open(zip_path, "wb") as f:
+                        f.write(zip_file.read())
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    data_dir = temp_dir
+
+                    st.write("Iniciando o treinamento supervisionado...")
+                    model_data = train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience)
+
+                    if model_data is None:
+                        st.error("Erro no treinamento do modelo.")
+                        shutil.rmtree(temp_dir)
+                        return
+
+                    model, classes = model_data
+                    # O modelo e as classes já estão armazenados no st.session_state
+                    st.success("Treinamento concluído!")
+
+                    # Opção para baixar o modelo treinado
+                    st.write("Faça o download do modelo treinado:")
+                    buffer = io.BytesIO()
+                    torch.save(model.state_dict(), buffer)
+                    buffer.seek(0)
+                    btn = st.download_button(
+                        label="Download do Modelo",
+                        data=buffer,
+                        file_name="modelo_treinado.pth",
+                        mime="application/octet-stream",
+                        key="download_model_button"
+                    )
+
+                    # Salvar as classes em um arquivo
+                    classes_data = "\n".join(classes)
+                    st.download_button(
+                        label="Download das Classes",
+                        data=classes_data,
+                        file_name="classes.txt",
+                        mime="text/plain",
+                        key="download_classes_button"
+                    )
+
+                    # Limpar o diretório temporário
+                    shutil.rmtree(temp_dir)
+                else:
+                    st.warning("Por favor, forneça os dados e as configurações corretas para o modo clássico.")
+            elif mode == "Quântico (TFQ)":
+                if epochs_q > 0 and batch_size_q > 0:
+                    # Treinamento quântico baseado no MNIST 3 vs. 6
+                    st.write("Iniciando o treinamento do modelo quântico...")
+                    q_model, q_history, q_results, backend = train_quantum_model(
+                        epochs=epochs_q, 
+                        batch_size=batch_size_q,
+                        threshold=threshold_q,
+                        circuit_type=circuit_type,
+                        optimizer_type=optimizer_type,
+                        use_hardware=use_hardware,
+                        backend_name=backend_name
+                    )
+                    if q_model is not None:
+                        st.success("Treinamento do modelo quântico concluído!")
+
+                        # Exibir resultados
+                        st.write("**Resultados de Teste (Loss, Hinge Accuracy):**", q_results)
+
+                        # Plotar histórico de perda
+                        fig, ax = plt.subplots()
+                        ax.plot(q_history.history['loss'], label='Treino')
+                        ax.plot(q_history.history['val_loss'], label='Validação')
+                        ax.set_title("Evolução da Perda (QNN)")
+                        ax.set_xlabel("Épocas")
+                        ax.set_ylabel("Perda")
+                        ax.legend()
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+                        # Salvar o modelo quântico
+                        q_model.save("quantum_model.h5")
+                        st.write("Modelo quântico salvo como `quantum_model.h5`.")
+
+                        # Salvar as classes em um arquivo
+                        # Como o treinamento quântico foi feito com MNIST 3 vs. 6, as classes são fixas
+                        classes_q = ["3", "6"]
+                        classes_data_q = "\n".join(classes_q)
+                        st.download_button(
+                            label="Download das Classes (Quântico)",
+                            data=classes_data_q,
+                            file_name="classes_quantic.txt",
+                            mime="text/plain",
+                            key="download_classes_quantic_button"
+                        )
+                    else:
+                        st.error("Erro no treinamento do modelo quântico.")
+                else:
+                    st.warning("Por favor, forneça os dados e as configurações corretas para o modo quântico.")
+        else:
+            st.warning("Por favor, forneça os dados e as configurações corretas.")
+
+    # Avaliação de uma imagem individual
+    st.header("Avaliação de Imagem")
+    evaluate = st.radio("Deseja avaliar uma imagem?", ("Sim", "Não"), key="evaluate_option")
+    if evaluate == "Sim":
+        eval_image_file = st.file_uploader("Faça upload da imagem para avaliação", type=["png", "jpg", "jpeg", "bmp", "gif"], key="eval_image_file")
+        if eval_image_file is not None:
+            eval_image_file.seek(0)
+            try:
+                eval_image = Image.open(eval_image_file).convert("RGB")
+            except Exception as e:
+                st.error(f"Erro ao abrir a imagem: {e}")
+                return
+
+            st.image(eval_image, caption='Imagem para avaliação', use_container_width=True)
+
+            if mode == "Clássico (PyTorch)":
+                # Verificar se o modelo já foi carregado ou treinado
+                if 'model' not in st.session_state or 'classes' not in st.session_state:
+                    st.warning("Nenhum modelo carregado ou treinado. Por favor, carregue um modelo existente ou treine um novo modelo.")
+                else:
+                    model_eval = st.session_state['model']
+                    classes_eval = st.session_state['classes']
+                    model_name_eval = st.session_state.get('trained_model_name', 'ResNet18')  # Usa o nome do modelo armazenado
+
+                    class_name, confidence = evaluate_image(model_eval, eval_image, classes_eval)
+                    st.write(f"**Classe Predita:** {class_name}")
+                    st.write(f"**Confiança:** {confidence:.4f}")
+
+                    # Opção para visualizar segmentação
+                    segmentation = False
+                    if segmentation_model is not None:
+                        segmentation = st.checkbox("Visualizar Segmentação", value=True, key="segmentation_checkbox")
+
+                    # Visualizar ativações e segmentação
+                    visualize_activations(model_eval, eval_image, classes_eval, model_name_eval, segmentation_model=segmentation_model, segmentation=segmentation)
+            elif mode == "Quântico (TFQ)":
+                # Verificar se o modelo quântico está carregado ou treinado
+                if 'q_model' not in st.session_state or 'classes' not in st.session_state:
+                    st.warning("Nenhum modelo quântico carregado ou treinado. Por favor, carregue um modelo quântico existente ou treine um novo modelo.")
+                else:
+                    q_model_eval = st.session_state['q_model']
+                    classes_eval = st.session_state['classes']  # Para o modo quântico, classes devem ser ["3", "6"]
+
+                    # Preparar a imagem para o modelo quântico
+                    # Reduzir para 4x4 e binarizar
+                    image_tensor = tf.image.resize(np.array(eval_image), (4,4))[..., np.newaxis] / 255.0
+                    image_bin = (image_tensor > threshold_q).numpy().astype(np.float32).flatten()
+
+                    # Converter para circuito
+                    def convert_to_circuit_q(image_bin):
+                        qubits = cirq.GridQubit.rect(4,4)
+                        circuit = cirq.Circuit()
+                        for i, v in enumerate(image_bin):
+                            if v:
+                                circuit.append(cirq.X(qubits[i]))
+                        return circuit
+
+                    circuit = convert_to_circuit_q(image_bin)
+                    x_eval_circ = tfq.convert_to_tensor([circuit])
+
+                    # Fazer a previsão
+                    y_pred = q_model_eval.predict(x_eval_circ)
+                    # y_pred está na faixa [-1, 1] devido ao uso de Hinge Loss
+                    predicted_label = 1 if y_pred[0][0] > 0 else 0
+                    confidence_q = abs(y_pred[0][0])
+
+                    class_name = classes_eval[predicted_label]
+                    st.write(f"**Classe Predita (Quântico):** {class_name}")
+                    st.write(f"**Confiança (Quântico):** {confidence_q:.4f}")
+
+                    # Visualizar ativações - Grad-CAM não está implementado para modelos quânticos
+                    st.write("Visualização de ativações não está disponível para o modo quântico.")
+
+    st.write("### Documentação dos Procedimentos")
+    st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
+
+    # Encerrar a aplicação
+    st.write("Obrigado por utilizar o aplicativo!")
+
 def train_segmentation_model(images_dir, masks_dir, num_classes):
     """
     Treina o modelo de segmentação com o conjunto de dados fornecido pelo usuário.
@@ -1031,244 +1559,11 @@ def train_segmentation_model(images_dir, masks_dir, num_classes):
                 loss = criterion(outputs, masks)
                 val_loss += loss.item() * inputs.size(0)
 
-        val_epoch_loss = val_loss / len(val_loader.dataset)
-        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Validação: {val_epoch_loss:.4f}')
+        val_loss = val_loss / len(val_loader.dataset)
+        st.write(f'Época [{epoch+1}/{num_epochs}], Perda de Validação: {val_loss:.4f}')
 
     return model
 
-def main():
-    # Definir o caminho do ícone
-    icon_path = "logo.png"  # Verifique se o arquivo logo.png está no diretório correto
-
-    # Verificar se o arquivo de ícone existe antes de configurá-lo
-    if os.path.exists(icon_path):
-        try:
-            st.set_page_config(page_title="Geomaker", page_icon=icon_path, layout="wide")
-            logging.info(f"Ícone {icon_path} carregado com sucesso.")
-        except Exception as e:
-            st.set_page_config(page_title="Geomaker", layout="wide")
-            logging.warning(f"Erro ao carregar o ícone {icon_path}: {e}")
-    else:
-        # Se o ícone não for encontrado, carrega sem favicon
-        st.set_page_config(page_title="Geomaker", layout="wide")
-        logging.warning(f"Ícone {icon_path} não encontrado, carregando sem favicon.")
-
-    # Layout da página
-    if os.path.exists('capa.png'):
-        try:
-            st.image('capa.png', caption='Laboratório de Educação e Inteligência Artificial - Geomaker. "A melhor forma de prever o futuro é inventá-lo." - Alan Kay', use_container_width=True)  # Substituído aqui
-        except UnidentifiedImageError:
-            st.warning("Imagem 'capa.png' não pôde ser carregada ou está corrompida.")
-    else:
-        st.warning("Imagem 'capa.png' não encontrada.")
-
-    # Carregar o logotipo na barra lateral
-    if os.path.exists("logo.png"):
-        try:
-            st.sidebar.image("logo.png", width=200)
-        except UnidentifiedImageError:
-            st.sidebar.text("Imagem do logotipo não pôde ser carregada ou está corrompida.")
-    else:
-        st.sidebar.text("Imagem do logotipo não encontrada.")
-
-    st.title("Classificação e Segmentação de Imagens com Aprendizado Profundo")
-    st.write("Este aplicativo permite treinar um modelo de classificação de imagens, aplicar algoritmos de clustering para análise comparativa e realizar segmentação de objetos.")
-    st.write("As etapas são cuidadosamente documentadas para auxiliar na reprodução e análise científica.")
-
-    # Inicializar segmentation_model
-    segmentation_model = None
-
-    # Opções para o modelo de segmentação
-    st.subheader("Opções para o Modelo de Segmentação")
-    segmentation_option = st.selectbox("Deseja utilizar um modelo de segmentação?", ["Não", "Utilizar modelo pré-treinado", "Treinar novo modelo de segmentação"])
-    if segmentation_option == "Utilizar modelo pré-treinado":
-        num_classes_segmentation = st.number_input("Número de Classes para Segmentação (Modelo Pré-treinado):", min_value=1, step=1, value=21)
-        segmentation_model = get_segmentation_model(num_classes=num_classes_segmentation)
-        st.write("Modelo de segmentação pré-treinado carregado.")
-    elif segmentation_option == "Treinar novo modelo de segmentação":
-        st.write("Treinamento do modelo de segmentação com seu próprio conjunto de dados.")
-        num_classes_segmentation = st.number_input("Número de Classes para Segmentação:", min_value=1, step=1)
-        # Upload do conjunto de dados de segmentação
-        segmentation_zip = st.file_uploader("Faça upload de um arquivo ZIP contendo as imagens e máscaras de segmentação", type=["zip"])
-        if segmentation_zip is not None:
-            temp_seg_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_seg_dir, "segmentation.zip")
-            with open(zip_path, "wb") as f:
-                f.write(segmentation_zip.read())
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_seg_dir)
-
-            # Espera-se que as imagens estejam em 'images/' e as máscaras em 'masks/' dentro do ZIP
-            images_dir = os.path.join(temp_seg_dir, 'images')
-            masks_dir = os.path.join(temp_seg_dir, 'masks')
-
-            if os.path.exists(images_dir) and os.path.exists(masks_dir):
-                # Treinar o modelo de segmentação
-                st.write("Iniciando o treinamento do modelo de segmentação...")
-                segmentation_model = train_segmentation_model(images_dir, masks_dir, num_classes_segmentation)
-                if segmentation_model is not None:
-                    st.success("Treinamento do modelo de segmentação concluído!")
-            else:
-                st.error("Estrutura de diretórios inválida no arquivo ZIP. Certifique-se de que as imagens estão em 'images/' e as máscaras em 'masks/'.")
-        else:
-            st.warning("Aguardando o upload do conjunto de dados de segmentação.")
-    else:
-        segmentation_model = None
-
-    # Barra Lateral de Configurações
-    st.sidebar.title("Configurações do Treinamento")
-
-    # Seleção de modo - Apenas Clássico
-    mode = "Clássico (PyTorch)"  # Definido fixamente
-
-    st.sidebar.markdown(f"**Modo Selecionado:** {mode}")
-
-    if mode == "Clássico (PyTorch)":
-        num_classes = st.sidebar.number_input("Número de Classes:", min_value=2, step=1, key="num_classes")
-        model_name = st.sidebar.selectbox("Modelo Pré-treinado:", options=['ResNet18', 'ResNet50', 'DenseNet121'], key="model_name")
-        fine_tune = st.sidebar.checkbox("Fine-Tuning Completo", value=False, key="fine_tune")
-        epochs = st.sidebar.slider("Número de Épocas:", min_value=1, max_value=500, value=200, step=1, key="epochs")
-        learning_rate = st.sidebar.select_slider("Taxa de Aprendizagem:", options=[0.1, 0.01, 0.001, 0.0001], value=0.0001, key="learning_rate")
-        batch_size = st.sidebar.selectbox("Tamanho de Lote:", options=[4, 8, 16, 32, 64], index=2, key="batch_size")
-        train_split = st.sidebar.slider("Percentual de Treinamento:", min_value=0.5, max_value=0.9, value=0.7, step=0.05, key="train_split")
-        valid_split = st.sidebar.slider("Percentual de Validação:", min_value=0.05, max_value=0.4, value=0.15, step=0.05, key="valid_split")
-        l2_lambda = st.sidebar.number_input("L2 Regularization (Weight Decay):", min_value=0.0, max_value=0.1, value=0.01, step=0.01, key="l2_lambda")
-        patience = st.sidebar.number_input("Paciência para Early Stopping:", min_value=1, max_value=10, value=3, step=1, key="patience")
-        use_weighted_loss = st.sidebar.checkbox("Usar Perda Ponderada para Classes Desbalanceadas", value=False, key="use_weighted_loss")
-
-    # Opções de carregamento do modelo
-    st.header("Opções de Carregamento do Modelo")
-
-    model_option = st.selectbox("Escolha uma opção:", ["Treinar um novo modelo", "Carregar um modelo existente"], key="model_option_main")
-    if model_option == "Carregar um modelo existente":
-        if mode == "Clássico (PyTorch)":
-            # Upload do modelo pré-treinado
-            model_file = st.file_uploader("Faça upload do arquivo do modelo (.pt ou .pth)", type=["pt", "pth"], key="model_file_uploader_main")
-            if model_file is not None:
-                if num_classes > 0:
-                    # Carregar o modelo clássico
-                    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False)
-                    if model is None:
-                        st.error("Erro ao carregar o modelo.")
-                        return
-
-                    # Carregar os pesos do modelo
-                    try:
-                        state_dict = torch.load(model_file, map_location=device)
-                        model.load_state_dict(state_dict)
-                        st.session_state['model'] = model
-                        st.session_state['trained_model_name'] = model_name  # Armazena o nome do modelo treinado
-                        st.success("Modelo clássico carregado com sucesso!")
-                    except Exception as e:
-                        st.error(f"Erro ao carregar o modelo: {e}")
-                        return
-
-                    # Carregar as classes
-                    classes_file = st.file_uploader("Faça upload do arquivo com as classes (classes.txt)", type=["txt"], key="classes_file_uploader_main")
-                    if classes_file is not None:
-                        classes = classes_file.read().decode("utf-8").splitlines()
-                        st.session_state['classes'] = classes
-                        st.write(f"Classes carregadas: {classes}")
-                    else:
-                        st.error("Por favor, forneça o arquivo com as classes.")
-                else:
-                    st.warning("Por favor, forneça o número de classes correto.")
-    elif model_option == "Treinar um novo modelo":
-        # Upload do arquivo ZIP
-        zip_file = st.file_uploader("Upload do arquivo ZIP com as imagens", type=["zip"], key="zip_file_uploader")
-        if zip_file is not None:
-            if mode == "Clássico (PyTorch)":
-                if num_classes > 0 and train_split + valid_split <= 0.95:
-                    temp_dir = tempfile.mkdtemp()
-                    zip_path = os.path.join(temp_dir, "uploaded.zip")
-                    with open(zip_path, "wb") as f:
-                        f.write(zip_file.read())
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(temp_dir)
-                    data_dir = temp_dir
-
-                    st.write("Iniciando o treinamento supervisionado...")
-                    model_data = train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience)
-
-                    if model_data is None:
-                        st.error("Erro no treinamento do modelo.")
-                        shutil.rmtree(temp_dir)
-                        return
-
-                    model, classes = model_data
-                    # O modelo e as classes já estão armazenados no st.session_state
-                    st.success("Treinamento concluído!")
-
-                    # Opção para baixar o modelo treinado
-                    st.write("Faça o download do modelo treinado:")
-                    buffer = io.BytesIO()
-                    torch.save(model.state_dict(), buffer)
-                    buffer.seek(0)
-                    btn = st.download_button(
-                        label="Download do Modelo",
-                        data=buffer,
-                        file_name="modelo_treinado.pth",
-                        mime="application/octet-stream",
-                        key="download_model_button"
-                    )
-
-                    # Salvar as classes em um arquivo
-                    classes_data = "\n".join(classes)
-                    st.download_button(
-                        label="Download das Classes",
-                        data=classes_data,
-                        file_name="classes.txt",
-                        mime="text/plain",
-                        key="download_classes_button"
-                    )
-
-                    # Limpar o diretório temporário
-                    shutil.rmtree(temp_dir)
-                else:
-                    st.warning("Por favor, forneça os dados e as configurações corretas para o modo clássico.")
-    else:
-        st.warning("Por favor, forneça os dados e as configurações corretas.")
-
-    # Avaliação de uma imagem individual
-    st.header("Avaliação de Imagem")
-    evaluate = st.radio("Deseja avaliar uma imagem?", ("Sim", "Não"), key="evaluate_option")
-    if evaluate == "Sim":
-        eval_image_file = st.file_uploader("Faça upload da imagem para avaliação", type=["png", "jpg", "jpeg", "bmp", "gif"], key="eval_image_file")
-        if eval_image_file is not None:
-            eval_image_file.seek(0)
-            try:
-                eval_image = Image.open(eval_image_file).convert("RGB")
-            except Exception as e:
-                st.error(f"Erro ao abrir a imagem: {e}")
-                return
-
-            st.image(eval_image, caption='Imagem para avaliação', use_container_width=True)  # Substituído aqui
-
-            if mode == "Clássico (PyTorch)":
-                # Verificar se o modelo já foi carregado ou treinado
-                if 'model' not in st.session_state or 'classes' not in st.session_state:
-                    st.warning("Nenhum modelo carregado ou treinado. Por favor, carregue um modelo existente ou treine um novo modelo.")
-                else:
-                    model_eval = st.session_state['model']
-                    classes_eval = st.session_state['classes']
-                    model_name_eval = st.session_state.get('trained_model_name', 'ResNet18')  # Usa o nome do modelo armazenado
-
-                    class_name, confidence = evaluate_image(model_eval, eval_image, classes_eval)
-                    st.write(f"**Classe Predita:** {class_name}")
-                    st.write(f"**Confiança:** {confidence:.4f}")
-
-                    # Opção para visualizar segmentação
-                    segmentation = False
-                    if segmentation_model is not None:
-                        segmentation = st.checkbox("Visualizar Segmentação", value=True, key="segmentation_checkbox")
-
-                    # Visualizar ativações e segmentação
-                    visualize_activations(model_eval, eval_image, classes_eval, model_name_eval, segmentation_model=segmentation_model, segmentation=segmentation)
-    st.write("### Documentação dos Procedimentos")
-    st.write("Todas as etapas foram cuidadosamente registradas. Utilize esta documentação para reproduzir o experimento e analisar os resultados.")
-
-    # Encerrar a aplicação
-    st.write("Obrigado por utilizar o aplicativo!")
-
+# Executar a aplicação
 if __name__ == "__main__":
     main()
