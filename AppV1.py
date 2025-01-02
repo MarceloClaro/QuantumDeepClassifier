@@ -41,6 +41,10 @@ import sympy
 from qiskit import IBMQ, Aer, transpile
 from qiskit.providers.ibmq import least_busy
 
+
+print("Todas as bibliotecas foram importadas com sucesso!")
+
+
 # Supressão dos avisos relacionados ao torch.classes
 warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.classes.*")
 
