@@ -12,9 +12,9 @@ torchcam==0.4.0
 opencv-python-headless==4.10.0.84
 statsmodels==0.14.4
 psutil==6.1.1
-tensorflow==2.11.0
-tensorflow-quantum==0.7.3
+tensorflow==2.12.0
+tensorflow-quantum==0.8.0
 cirq==1.3.0
 sympy==1.12
-qiskit==0.50.0
+qiskit
 absl-py==1.4.0
