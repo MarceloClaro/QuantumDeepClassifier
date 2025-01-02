@@ -50,6 +50,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Configurações para tornar os gráficos mais bonitos
 sns.set_style('whitegrid')
 
+# Definir seed para reprodutibilidade
 def set_seed(seed):
     """
     Define uma seed para garantir a reprodutibilidade.
@@ -57,6 +58,7 @@ def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    tf.random.set_seed(seed)  # Adicionado para TensorFlow
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     # As linhas abaixo são recomendadas para garantir reprodutibilidade
@@ -180,7 +182,7 @@ def plot_class_distribution(dataset, classes):
     st.pyplot(fig)
     plt.close(fig)  # Fechar a figura para liberar memória
 
-def get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False):
+def get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False, seed=42):
     """
     Retorna o modelo pré-treinado selecionado para classificação.
     """
@@ -203,16 +205,26 @@ def get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False):
 
     if model_name.startswith('ResNet'):
         num_ftrs = model.fc.in_features
+        initializer = nn.init.kaiming_uniform_
         model.fc = nn.Sequential(
             nn.Dropout(p=dropout_p),
             nn.Linear(num_ftrs, num_classes)
         )
+        # Aplicar inicialização com seed
+        torch.manual_seed(seed)
+        initializer(model.fc[1].weight)
+        nn.init.constant_(model.fc[1].bias, 0)
     elif model_name.startswith('DenseNet'):
         num_ftrs = model.classifier.in_features
+        initializer = nn.init.kaiming_uniform_
         model.classifier = nn.Sequential(
             nn.Dropout(p=dropout_p),
             nn.Linear(num_ftrs, num_classes)
         )
+        # Aplicar inicialização com seed
+        torch.manual_seed(seed)
+        initializer(model.classifier[1].weight)
+        nn.init.constant_(model.classifier[1].bias, 0)
     else:
         st.error("Modelo não suportado.")
         return None
@@ -220,7 +232,7 @@ def get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False):
     model = model.to(device)
     return model
 
-def get_segmentation_model(num_classes, fine_tune=False):
+def get_segmentation_model(num_classes, fine_tune=False, seed=42):
     """
     Retorna o modelo pré-treinado para segmentação.
     """
@@ -233,10 +245,18 @@ def get_segmentation_model(num_classes, fine_tune=False):
     # Ajustar a última camada para o número de classes do usuário
     model.classifier[4] = nn.Conv2d(512, num_classes, kernel_size=1)
     model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+
+    # Aplicar inicialização com seed
+    torch.manual_seed(seed)
+    nn.init.kaiming_uniform_(model.classifier[4].weight, a=1)
+    nn.init.constant_(model.classifier[4].bias, 0)
+    nn.init.kaiming_uniform_(model.aux_classifier[4].weight, a=1)
+    nn.init.constant_(model.aux_classifier[4].bias, 0)
+
     model = model.to(device)
     return model
 
-def apply_transforms_and_get_embeddings(dataset, model, transform, batch_size=16):
+def apply_transforms_and_get_embeddings(dataset, model, transform, batch_size=16, seed=42):
     """
     Aplica as transformações às imagens, extrai os embeddings e retorna um DataFrame.
     """
@@ -313,7 +333,7 @@ def display_all_augmented_images(df, class_names, max_images=None):
                 image = df.iloc[idx]['augmented_image']
                 label = df.iloc[idx]['label']
                 with cols[col]:
-                    st.image(image, caption=class_names[label], use_container_width=True)  # Substituído aqui
+                    st.image(image, caption=class_names[label], use_container_width=True)
 
 def visualize_embeddings(df, class_names):
     """
@@ -345,11 +365,11 @@ def visualize_embeddings(df, class_names):
 
     st.plotly_chart(fig, use_container_width=True)
 
-def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience):
+def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience, seed=42):
     """
     Função principal para treinamento do modelo de classificação.
     """
-    set_seed(42)
+    set_seed(seed)
 
     # Carregar o dataset original sem transformações
     full_dataset = datasets.ImageFolder(root=data_dir)
@@ -386,16 +406,16 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
     test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
 
     # Criar dataframes para os conjuntos de treinamento, validação e teste com data augmentation e embeddings
-    model_for_embeddings = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False)
+    model_for_embeddings = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False, seed=seed)
     if model_for_embeddings is None:
         return None
 
     st.write("**Processando o Conjunto de Treinamento para Inclusão de Data Augmentation e Embeddings...**")
-    train_df = apply_transforms_and_get_embeddings(train_dataset, model_for_embeddings, train_transforms, batch_size=batch_size)
+    train_df = apply_transforms_and_get_embeddings(train_dataset, model_for_embeddings, train_transforms, batch_size=batch_size, seed=seed)
     st.write("**Processando o Conjunto de Validação...**")
-    valid_df = apply_transforms_and_get_embeddings(valid_dataset, model_for_embeddings, test_transforms, batch_size=batch_size)
+    valid_df = apply_transforms_and_get_embeddings(valid_dataset, model_for_embeddings, test_transforms, batch_size=batch_size, seed=seed)
     st.write("**Processando o Conjunto de Teste...**")
-    test_df = apply_transforms_and_get_embeddings(test_dataset, model_for_embeddings, test_transforms, batch_size=batch_size)
+    test_df = apply_transforms_and_get_embeddings(test_dataset, model_for_embeddings, test_transforms, batch_size=batch_size, seed=seed)
 
     # Mapear rótulos para nomes de classes
     class_to_idx = full_dataset.class_to_idx
@@ -443,7 +463,7 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
 
     # Dataloaders
     g = torch.Generator()
-    g.manual_seed(42)
+    g.manual_seed(seed)
 
     if use_weighted_loss:
         targets = [full_dataset.targets[i] for i in train_indices]
@@ -460,7 +480,7 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker, generator=g)
 
     # Carregar o modelo
-    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=fine_tune)
+    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=fine_tune, seed=seed)
     if model is None:
         return None
 
@@ -489,7 +509,8 @@ def train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_r
 
     # Treinamento
     for epoch in range(epochs):
-        set_seed(42 + epoch)
+        set_seed(seed + epoch)  # Atualizar a seed para cada época para evitar repetição
+
         running_loss = 0.0
         running_corrects = 0
         model.train()
@@ -907,8 +928,8 @@ def evaluate_image(model, image, classes):
     with torch.no_grad():
         output = model(image_tensor)
         probabilities = torch.nn.functional.softmax(output, dim=1)
-        confidence, predicted = torch.max(probabilities, 1)
-        class_idx = predicted.item()
+        confidence, pred = torch.max(probabilities, 1)
+        class_idx = pred.item()
         class_name = classes[class_idx]
         return class_name, confidence.item()
 
@@ -1047,7 +1068,8 @@ def train_quantum_model(
     circuit_type='Basic',
     optimizer_type='Adam',
     use_hardware=False,
-    backend_name='statevector_simulator'
+    backend_name='statevector_simulator',
+    seed=42
 ):
     """
     Treina um modelo quântico com diferentes tipos de circuitos e otimizações.
@@ -1055,6 +1077,8 @@ def train_quantum_model(
     
     Retorna o modelo Keras treinado, histórico, resultados e backend utilizado.
     """
+    set_seed(seed)
+
     # 1) Carregar MNIST e filtrar dígitos 3 e 6
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
     x_train, x_test = x_train / 255.0, x_test / 255.0
@@ -1074,7 +1098,7 @@ def train_quantum_model(
 
     # Binariza
     x_train_bin = np.array(x_train_small > threshold, dtype=np.float32)
-    x_test_bin  = np.array(x_test_small  > threshold, dtype=np.float32)
+    x_test_bin  = np.array(x_test_small  > threshold, dtype=np.float32).flatten()
 
     # 2) Converte cada imagem em um circuito Cirq
     def convert_to_circuit(image):
@@ -1087,7 +1111,7 @@ def train_quantum_model(
         return circuit
 
     x_train_circ = [convert_to_circuit(img) for img in x_train_bin]
-    x_test_circ  = [convert_to_circuit(img) for img in x_test_bin]
+    x_test_circ  = [convert_to_circuit(img) for img in x_test_bin.reshape(-1, 4, 4, 1)]
 
     # Converte para tensores
     x_train_tfcirc = tfq.convert_to_tensor(x_train_circ)
@@ -1187,7 +1211,7 @@ def train_quantum_model(
     # results = [loss, hinge_accuracy]
 
     # 9) Integração com Hardware Quântico (Opcional) - Removida
-    # Como Qiskit IBM Quantum foi removido, apenas informamos que usamos um backend simulado
+    # Como Qiskit IBM Quantum foi removido, informamos que usamos um backend simulado
     backend = backend_name  # Mantém a referência para compatibilidade
 
     st.write(f"Usando backend simulado: {backend_name}")
@@ -1242,11 +1266,11 @@ def main():
     segmentation_option = st.selectbox("Deseja utilizar um modelo de segmentação?", ["Não", "Utilizar modelo pré-treinado", "Treinar novo modelo de segmentação"])
     if segmentation_option == "Utilizar modelo pré-treinado":
         num_classes_segmentation = st.number_input("Número de Classes para Segmentação (Modelo Pré-treinado):", min_value=1, step=1, value=21)
-        segmentation_model = get_segmentation_model(num_classes=num_classes_segmentation)
+        segmentation_model = get_segmentation_model(num_classes=num_classes_segmentation, seed=42)
         st.write("Modelo de segmentação pré-treinado carregado.")
     elif segmentation_option == "Treinar novo modelo de segmentação":
         st.write("Treinamento do modelo de segmentação com seu próprio conjunto de dados.")
-        num_classes_segmentation = st.number_input("Número de Classes para Segmentação:", min_value=1, step=1)
+        num_classes_segmentation = st.number_input("Número de Classes para Segmentação:", min_value=1, step=1, value=2)
         # Upload do conjunto de dados de segmentação
         segmentation_zip = st.file_uploader("Faça upload de um arquivo ZIP contendo as imagens e máscaras de segmentação", type=["zip"])
         if segmentation_zip is not None:
@@ -1329,7 +1353,7 @@ def main():
             if model_file is not None:
                 if num_classes > 0:
                     # Carregar o modelo clássico
-                    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False)
+                    model = get_model(model_name, num_classes, dropout_p=0.5, fine_tune=False, seed=42)
                     if model is None:
                         st.error("Erro ao carregar o modelo.")
                         return
@@ -1390,7 +1414,7 @@ def main():
                     data_dir = temp_dir
 
                     st.write("Iniciando o treinamento supervisionado...")
-                    model_data = train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience)
+                    model_data = train_model(data_dir, num_classes, model_name, fine_tune, epochs, learning_rate, batch_size, train_split, valid_split, use_weighted_loss, l2_lambda, patience, seed=42)
 
                     if model_data is None:
                         st.error("Erro no treinamento do modelo.")
@@ -1439,7 +1463,8 @@ def main():
                         circuit_type=circuit_type,
                         optimizer_type=optimizer_type,
                         use_hardware=use_hardware,
-                        backend_name=backend_name
+                        backend_name=backend_name,
+                        seed=42
                     )
                     if q_model is not None:
                         st.success("Treinamento do modelo quântico concluído!")
@@ -1574,11 +1599,11 @@ def main():
     # Encerrar a aplicação
     st.write("Obrigado por utilizar o aplicativo!")
 
-def train_segmentation_model(images_dir, masks_dir, num_classes):
+def train_segmentation_model(images_dir, masks_dir, num_classes, seed=42):
     """
     Treina o modelo de segmentação com o conjunto de dados fornecido pelo usuário.
     """
-    set_seed(42)
+    set_seed(seed)
     batch_size = 4
     num_epochs = 25
     learning_rate = 0.001
@@ -1609,7 +1634,7 @@ def train_segmentation_model(images_dir, masks_dir, num_classes):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
     # Modelo
-    model = get_segmentation_model(num_classes=num_classes, fine_tune=True)
+    model = get_segmentation_model(num_classes=num_classes, fine_tune=True, seed=seed)
 
     # Otimizador e função de perda
     criterion = nn.CrossEntropyLoss()
